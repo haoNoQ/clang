@@ -10,6 +10,7 @@ add_clang_library(clangStaticAnalyzerCheckers
   ArrayBoundChecker.cpp
   ArrayBoundCheckerV2.cpp
   BasicObjCFoundationChecks.cpp
+  BasicStringBoundChecker.cpp
   BoolAssignmentChecker.cpp
   BuiltinFunctionChecker.cpp
   CStringChecker.cpp

@@ -233,6 +233,8 @@ ExprEngine::createTemporaryRegionIfNeeded(ProgramStateRef State,
     Reg = StoreMgr.evalDerivedToBase(Reg, *I);
   }
 
+  State = getCheckerManager().runCheckersForTemporaryValue(
+        State, LC, Ex, V, Reg);
   State = State->BindExpr(Result, LC, Reg);
   return State;
 }

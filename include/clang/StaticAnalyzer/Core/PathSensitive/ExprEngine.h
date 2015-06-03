@@ -170,6 +170,8 @@ public:
   ExplodedGraph& getGraph() { return G; }
   const ExplodedGraph& getGraph() const { return G; }
 
+  unsigned blockCount() { return getBuilderContext().blockCount(); }
+
   /// \brief Run the analyzer's garbage collection - remove dead symbols and
   /// bindings from the state.
   ///

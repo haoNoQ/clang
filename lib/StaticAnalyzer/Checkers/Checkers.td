@@ -569,6 +569,9 @@ def IntegerOverflowDef : Checker<"IntegerOverflow">,
 //===----------------------------------------------------------------------===//
 
 let ParentPackage = UndefBehaviorAlpha in {
+def BasicStringBoundChecker : Checker<"BasicStringBound">,
+  HelpText<"Warns if basic_string is accessed by index which is out of bounds">,
+  DescFile<"BasicStringBoundChecker.cpp">;
 def ConstModifiedChecker : Checker<"ConstModified">,
   HelpText<"Warns if variable declared as const or casted from const variable is modified">,
   DescFile<"ConstModifiedChecker.cpp">;

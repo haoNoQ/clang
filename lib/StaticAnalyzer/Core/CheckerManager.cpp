@@ -595,6 +595,22 @@ CheckerManager::runCheckersForPointerEscape(ProgramStateRef State,
   return State;
 }
 
+/// \brief Run checkers for creation of a new temporary value.
+ProgramStateRef
+CheckerManager::runCheckersForTemporaryValue(ProgramStateRef State,
+                                             const LocationContext *LCtx,
+                                             const Expr *E,
+                                             SVal Src, SVal Dst) {
+  for (size_t i = 0, e = TemporaryValueCheckers.size(); i != e; ++i) {
+    // If any checker declares the state infeasible (or if it starts that way),
+    // bail out.
+    if (!State)
+      return NULL;
+    State = TemporaryValueCheckers[i](State, LCtx, E, Src, Dst);
+  }
+  return State;
+}
+
 /// \brief Run checkers for handling assumptions on symbolic values.
 ProgramStateRef 
 CheckerManager::runCheckersForEvalAssume(ProgramStateRef state,
@@ -763,6 +779,11 @@ void CheckerManager::_registerForPointerEscape(CheckPointerEscapeFunc checkfn){
 void CheckerManager::_registerForConstPointerEscape(
                                           CheckPointerEscapeFunc checkfn) {
   PointerEscapeCheckers.push_back(checkfn);
+}
+
+void CheckerManager::_registerForTemporaryValue(
+    CheckTemporaryValueFunc checkfn) {
+  TemporaryValueCheckers.push_back(checkfn);
 }
 
 void CheckerManager::_registerForEvalAssume(EvalAssumeFunc checkfn) {

@@ -382,6 +382,22 @@ public:
                               PointerEscapeKind Kind,
                              RegionAndSymbolInvalidationTraits *ITraits);
 
+  /// \brief Run checkers when creating a new temporary value.
+  ///
+  /// This notifies the checkers about creation of a new temporary value.
+  /// This is helpful for C++ checkers tracking containers and iterators
+  /// because information about old value is dropped when creating a new one.
+  ///
+  /// \param State The state at the point of escape.
+  /// \param E The expression responsible for creation of a new value.
+  /// \param Src Symbolic value which is the source of a new value.
+  /// \param Dst a new temporary value that was created.
+  /// \returns Checkers can modify the state by returning a new one.
+  ProgramStateRef runCheckersForTemporaryValue(ProgramStateRef State,
+                                               const LocationContext *LCtx,
+                                               const Expr *E,
+                                               SVal Src, SVal Dst);
+
   /// \brief Run checkers for handling assumptions on symbolic values.
   ProgramStateRef runCheckersForEvalAssume(ProgramStateRef state,
                                            SVal Cond, bool Assumption);
@@ -488,7 +504,12 @@ public:
                                      PointerEscapeKind Kind,
                                      RegionAndSymbolInvalidationTraits *ITraits)>
       CheckPointerEscapeFunc;
-  
+
+  typedef CheckerFn<ProgramStateRef (ProgramStateRef State,
+                                     const LocationContext *LCtx,
+                                     const Expr *E, SVal Src, SVal Dst)>
+      CheckTemporaryValueFunc;
+
   typedef CheckerFn<ProgramStateRef (ProgramStateRef,
                                           const SVal &cond, bool assumption)>
       EvalAssumeFunc;
@@ -543,6 +564,8 @@ public:
   void _registerForPointerEscape(CheckPointerEscapeFunc checkfn);
 
   void _registerForConstPointerEscape(CheckPointerEscapeFunc checkfn);
+
+  void _registerForTemporaryValue(CheckTemporaryValueFunc checkfn);
 
   void _registerForEvalAssume(EvalAssumeFunc checkfn);
 
@@ -655,6 +678,8 @@ private:
   std::vector<RegionChangesCheckerInfo> RegionChangesCheckers;
 
   std::vector<CheckPointerEscapeFunc> PointerEscapeCheckers;
+
+  std::vector<CheckTemporaryValueFunc> TemporaryValueCheckers;
 
   std::vector<EvalAssumeFunc> EvalAssumeCheckers;
 

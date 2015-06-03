@@ -152,6 +152,8 @@ public:
   /// Called by CoreEngine when the analysis worklist is either empty or the
   //  maximum number of analysis steps have been reached.
   virtual void processEndWorklist(bool hasWorkRemaining) = 0;
+
+  virtual unsigned blockCount() = 0;
 };
 
 } // end GR namespace

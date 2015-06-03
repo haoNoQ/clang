@@ -418,21 +418,6 @@ void ExprEngine::examineStackFrames(const Decl *D, const LocationContext *LCtx,
 
 }
 
-static bool IsInStdNamespace(const FunctionDecl *FD) {
-  const DeclContext *DC = FD->getEnclosingNamespaceContext();
-  const NamespaceDecl *ND = dyn_cast<NamespaceDecl>(DC);
-  if (!ND)
-    return false;
-  
-  while (const DeclContext *Parent = ND->getParent()) {
-    if (!isa<NamespaceDecl>(Parent))
-      break;
-    ND = cast<NamespaceDecl>(Parent);
-  }
-
-  return ND->getName() == "std";
-}
-
 // The GDM component containing the dynamic dispatch bifurcation info. When
 // the exact type of the receiver is not known, we want to explore both paths -
 // one on which we do inline it and the other one on which we don't. This is
@@ -926,7 +911,7 @@ static bool mayInlineDecl(AnalysisDeclContext *CalleeADC,
       // Conditionally control the inlining of C++ standard library functions.
       if (!Opts.mayInlineCXXStandardLibrary())
         if (Ctx.getSourceManager().isInSystemHeader(FD->getLocation()))
-          if (IsInStdNamespace(FD))
+          if (AnalysisDeclContext::isInStdNamespace(FD))
             return false;
 
       // Conditionally control the inlining of methods on objects that look

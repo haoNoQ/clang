@@ -429,6 +429,25 @@ public:
   }
 };
 
+
+class TemporaryValue {
+  template <typename CHECKER>
+  static ProgramStateRef
+  _checkTemporaryValue(void *checker, ProgramStateRef State,
+                       const LocationContext *LCtx, const Expr *E,
+                       SVal Src, SVal Dst) {
+    return ((const CHECKER *)checker)->checkTemporaryValue(
+          State, LCtx, E, Src, Dst);
+  }
+public:
+  template <typename CHECKER>
+  static void _register(CHECKER *checker, CheckerManager &mgr) {
+    mgr._registerForTemporaryValue(CheckerManager::CheckTemporaryValueFunc(
+                                     checker, _checkTemporaryValue<CHECKER>));
+  }
+};
+
+
 } // end check namespace
 
 namespace eval {
