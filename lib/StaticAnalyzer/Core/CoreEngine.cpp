@@ -190,10 +190,19 @@ bool CoreEngine::ExecuteWorkList(const LocationContext *L, unsigned Steps,
     // Set the current block counter to being empty.
     WList->setBlockCounter(BCounterFactory.GetEmptyCounter());
 
-    if (!InitState)
+    if (!InitState) {
       // Generate the root.
       generateNode(StartLoc, SubEng.getInitialState(L), 0);
-    else
+
+      // Run checkers for BeginAnalysis.
+      const WorkListUnit &WU = WList->dequeue();
+      ExplodedNode *Node = WU.getNode();
+      ExplodedNodeSet Dst;
+      NodeBuilderContext BuilderCtx(*this, Entry, Node);
+      SubEng.processBeginWorklist(Node, Dst, &BuilderCtx);
+      enqueue(Dst);
+
+    } else
       generateNode(StartLoc, InitState, 0);
   }
 
@@ -218,11 +227,12 @@ bool CoreEngine::ExecuteWorkList(const LocationContext *L, unsigned Steps,
 
     // Retrieve the node.
     ExplodedNode *Node = WU.getNode();
+    FunctionSummaries->addNodeProceed(L->getDecl()->getCanonicalDecl());
 
     dispatchWorkItem(Node, Node->getLocation(), WU);
   }
   SubEng.processEndWorklist(hasWorkRemaining());
-  return WList->hasWork();
+  return WList->hasWork() || wasBlocksExhausted();
 }
 
 void CoreEngine::dispatchWorkItem(ExplodedNode* Pred, ProgramPoint Loc,
@@ -262,7 +272,9 @@ void CoreEngine::dispatchWorkItem(ExplodedNode* Pred, ProgramPoint Loc,
       assert(Loc.getAs<PostStmt>() ||
              Loc.getAs<PostInitializer>() ||
              Loc.getAs<PostImplicitCall>() ||
-             Loc.getAs<CallExitEnd>());
+             Loc.getAs<CallExitEnd>() ||
+             Loc.getAs<CallSummaryPreApply>() ||
+             Loc.getAs<CallSummaryPostApply>());
       HandlePostStmt(WU.getBlock(), WU.getIndex(), Pred);
       break;
   }
@@ -281,7 +293,6 @@ bool CoreEngine::ExecuteWorkListWithInitialState(const LocationContext *L,
 }
 
 void CoreEngine::HandleBlockEdge(const BlockEdge &L, ExplodedNode *Pred) {
-
   const CFGBlock *Blk = L.getDst();
   NodeBuilderContext BuilderCtx(*this, Blk, Pred);
 
@@ -299,6 +310,7 @@ void CoreEngine::HandleBlockEdge(const BlockEdge &L, ExplodedNode *Pred) {
 
     // Process the final state transition.
     SubEng.processEndOfFunction(BuilderCtx, Pred);
+    ProgramStateRef state = Pred->getState();
 
     // This path is done. Don't enqueue any more nodes.
     return;
@@ -321,7 +333,6 @@ void CoreEngine::HandleBlockEdge(const BlockEdge &L, ExplodedNode *Pred) {
 
 void CoreEngine::HandleBlockEntrance(const BlockEntrance &L,
                                        ExplodedNode *Pred) {
-
   // Increment the block counter.
   const LocationContext *LC = Pred->getLocationContext();
   unsigned BlockId = L.getBlock()->getBlockID();
@@ -331,15 +342,16 @@ void CoreEngine::HandleBlockEntrance(const BlockEntrance &L,
   WList->setBlockCounter(Counter);
 
   // Process the entrance of the block.
+  NodeBuilderContext Ctx(*this, L.getBlock(), Pred);
   if (Optional<CFGElement> E = L.getFirstElement()) {
-    NodeBuilderContext Ctx(*this, L.getBlock(), Pred);
     SubEng.processCFGElement(*E, Pred, 0, &Ctx);
   }
   else
-    HandleBlockExit(L.getBlock(), Pred);
+    HandleBlockExit(L.getBlock(), Pred, &Ctx);
 }
 
-void CoreEngine::HandleBlockExit(const CFGBlock * B, ExplodedNode *Pred) {
+void CoreEngine::HandleBlockExit(const CFGBlock * B, ExplodedNode *Pred,
+                                 NodeBuilderContext *Ctx) {
 
   if (const Stmt *Term = B->getTerminator()) {
     switch (Term->getStmtClass()) {
@@ -369,15 +381,8 @@ void CoreEngine::HandleBlockExit(const CFGBlock * B, ExplodedNode *Pred) {
         return;
 
       case Stmt::CXXTryStmtClass: {
-        // Generate a node for each of the successors.
-        // Our logic for EH analysis can certainly be improved.
-        for (CFGBlock::const_succ_iterator it = B->succ_begin(),
-             et = B->succ_end(); it != et; ++it) {
-          if (const CFGBlock *succ = *it) {
-            generateNode(BlockEdge(B, succ, Pred->getLocationContext()),
-                         Pred->State, Pred);
-          }
-        }
+        CXXTryNodeBuilder builder(Pred, B, this);
+        SubEng.processCXXTry(builder);
         return;
       }
         
@@ -431,7 +436,7 @@ void CoreEngine::HandleBlockExit(const CFGBlock * B, ExplodedNode *Pred) {
 
       case Stmt::SwitchStmtClass: {
         SwitchNodeBuilder builder(Pred, B, cast<SwitchStmt>(Term)->getCond(),
-                                    this);
+                                    this, Ctx);
 
         SubEng.processSwitch(builder);
         return;
@@ -479,10 +484,10 @@ void CoreEngine::HandlePostStmt(const CFGBlock *B, unsigned StmtIdx,
   assert(B);
   assert(!B->empty());
 
+  NodeBuilderContext Ctx(*this, B, Pred);
   if (StmtIdx == B->size())
-    HandleBlockExit(B, Pred);
+    HandleBlockExit(B, Pred, &Ctx);
   else {
-    NodeBuilderContext Ctx(*this, B, Pred);
     SubEng.processCFGElement((*B)[StmtIdx], Pred, StmtIdx, &Ctx);
   }
 }
@@ -513,7 +518,8 @@ void CoreEngine::enqueueStmtNode(ExplodedNode *N,
   assert (!N->isSink());
 
   // Check if this node entered a callee.
-  if (N->getLocation().getAs<CallEnter>()) {
+  if (N->getLocation().getAs<CallEnter>() ||
+      N->getLocation().getAs<CallSummaryPreApply>()) {
     // Still use the index of the CallExpr. It's needed to create the callee
     // StackFrameContext.
     WList->enqueue(N, Block, Idx);
@@ -522,7 +528,8 @@ void CoreEngine::enqueueStmtNode(ExplodedNode *N,
 
   // Do not create extra nodes. Move to the next CFG element.
   if (N->getLocation().getAs<PostInitializer>() ||
-      N->getLocation().getAs<PostImplicitCall>()) {
+      N->getLocation().getAs<PostImplicitCall>() ||
+      N->getLocation().getAs<CallSummaryPostApply>()) {
     WList->enqueue(N, Block, Idx+1);
     return;
   }
@@ -583,13 +590,29 @@ void CoreEngine::enqueue(ExplodedNodeSet &Set,
 
 void CoreEngine::enqueueEndOfFunction(ExplodedNodeSet &Set) {
   for (ExplodedNodeSet::iterator I = Set.begin(), E = Set.end(); I != E; ++I) {
+
     ExplodedNode *N = *I;
     // If we are in an inlined call, generate CallExitBegin node.
-    if (N->getLocationContext()->getParent()) {
-      N = generateCallExitBeginNode(N);
-      if (N)
-        WList->enqueue(N);
+    if (HowToInline != Inline_Summary) {
+      if (N->getLocationContext()->getParent()) {
+        N = generateCallExitBeginNode(N);
+        if (N)
+          WList->enqueue(N);
+      } else {
+        // TODO: We should run remove dead bindings here.
+        G->addEndOfPath(N);
+        NumPathsExplored++;
+      }
     } else {
+      ProgramStateRef state = (*I)->getState();
+      const LocationContext *LC = (*I)->getLocationContext();
+      if (const FunctionDecl *FD = dyn_cast<FunctionDecl>(
+            LC->getDecl()->getCanonicalDecl())) {
+        FunctionCallSummary &Sum(
+            CurrentCallSummary->FindAndConstruct(FD).second);
+        Sum.push_back(new FunctionCallBranchSummary(state, N, &SubEng));
+      }
+
       // TODO: We should run remove dead bindings here.
       G->addEndOfPath(N);
       NumPathsExplored++;
@@ -705,4 +728,12 @@ SwitchNodeBuilder::generateDefaultCaseNode(ProgramStateRef St,
     Eng.WList->enqueue(Succ);
 
   return Succ;
+}
+
+void CXXTryNodeBuilder::generateNode(const CFGBlock *succ, ProgramStateRef State) {
+  bool IsNew;
+  ExplodedNode *Node = Eng.G->getNode(BlockEdge(Src, succ, Pred->getLocationContext()),
+                                      State, false, &IsNew);
+  Node->addPredecessor(Pred, *Eng.G);
+  if (IsNew) Eng.WList->enqueue(Node);
 }

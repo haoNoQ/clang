@@ -52,6 +52,8 @@ namespace clang {
   class DiagnosticsEngine;
   class Expr;
   class ExternalASTSource;
+  class ASTImporter;
+  class ASTUnit;
   class ASTMutationListener;
   class IdentifierTable;
   class MaterializeTemporaryExpr;
@@ -63,6 +65,7 @@ namespace clang {
   class MangleContext;
   class ObjCIvarDecl;
   class ObjCPropertyDecl;
+  class Sema;
   class UnresolvedSetIterator;
   class UsingDecl;
   class UsingShadowDecl;
@@ -1569,6 +1572,26 @@ public:
   static bool isObjCNSObjectType(QualType Ty) {
     return Ty->isObjCNSObjectType();
   }
+
+  //===--------------------------------------------------------------------===//
+  //                         Cross-translation unit support
+  //===--------------------------------------------------------------------===//
+private:
+  typedef std::map<std::string, std::string> FunctionFileMapping;
+  typedef std::map<std::string, clang::ASTUnit *> FunctionAstUnitMapping;
+  typedef std::map<std::string, clang::ASTUnit *> FileASTUnitMapping;
+  typedef std::map<TranslationUnitDecl *, ASTImporter *> ASTUnitImporterMapping;
+  typedef std::map<const FunctionDecl *, const FunctionDecl *> ImportMapping;
+  FileASTUnitMapping FileASTUnitMap;
+  FunctionAstUnitMapping FunctionAstUnitMap;
+  FunctionFileMapping FunctionFileMap;
+  ASTUnitImporterMapping ASTUnitImporterMap;
+  ImportMapping ImportMap;
+  ASTImporter &getOrCreateASTImporter(ASTContext &From);
+
+public:
+  const FunctionDecl *getXTUDefinition(const FunctionDecl *FD,
+                                       clang::Sema *S = NULL);
 
   //===--------------------------------------------------------------------===//
   //                         Type Sizing and Analysis

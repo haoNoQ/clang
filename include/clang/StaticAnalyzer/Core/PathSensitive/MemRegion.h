@@ -189,6 +189,9 @@ public:
   template<typename RegionTy> const RegionTy* getAs() const;
 
   virtual bool isBoundable() const { return false; }
+
+  SVal getAddress(ProgramStateRef state) const;
+
 };
 
 /// MemSpaceRegion - A memory region that represents a "memory space";
@@ -447,6 +450,7 @@ public:
 ///  by a call to 'alloca'.
 class AllocaRegion : public SubRegion {
   friend class MemRegionManager;
+  friend class AccessChain;
 protected:
   unsigned Cnt; // Block counter.  Used to distinguish different pieces of
                 // memory allocated by alloca at the same call site.
@@ -458,6 +462,8 @@ protected:
 public:
 
   const Expr *getExpr() const { return Ex; }
+
+  unsigned getCount() const { return Cnt; }
 
   bool isBoundable() const { return true; }
 

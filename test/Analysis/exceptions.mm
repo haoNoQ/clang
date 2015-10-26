@@ -29,10 +29,9 @@ void inlinedCXX() {
 
 int testCXX() {
   int a; // uninitialized
-  // FIXME: this should be reported as a leak, because C++ exceptions are
-  // often not fatal.
   void *mem = malloc(4);
   inlinedCXX();
   free(mem);
-  return a; // no-warning
+  return a;
+  // expected-warning@+1{{Potential leak of memory pointed to by 'mem'}}
 }

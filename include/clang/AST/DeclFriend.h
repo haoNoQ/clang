@@ -166,6 +166,7 @@ public:
 
   friend class ASTDeclReader;
   friend class ASTDeclWriter;
+  friend class ASTNodeImporter;
 };
 
 /// An iterator over the friend declarations of a class.

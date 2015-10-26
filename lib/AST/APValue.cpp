@@ -72,7 +72,13 @@ namespace {
     unsigned PathLength;
   };
 }
-
+void APValue::Profile(llvm::FoldingSetNodeID &id) const {
+  if (isInt()) {
+    getInt().Profile(id);
+  } else if (isFloat()){
+    getFloat().Profile(id);
+  }
+}
 struct APValue::MemberPointerData : MemberPointerBase {
   static const unsigned InlinePathSpace =
       (MaxSize - sizeof(MemberPointerBase)) / sizeof(const CXXRecordDecl*);

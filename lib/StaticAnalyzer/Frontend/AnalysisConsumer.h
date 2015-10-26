@@ -22,6 +22,7 @@
 namespace clang {
 
 class ASTConsumer;
+class CompilerInstance;
 class Preprocessor;
 class DiagnosticsEngine;
 
@@ -31,7 +32,8 @@ class CheckerManager;
 /// CreateAnalysisConsumer - Creates an ASTConsumer to run various code
 /// analysis passes.  (The set of analyses run is controlled by command-line
 /// options.)
-ASTConsumer* CreateAnalysisConsumer(const Preprocessor &pp,
+ASTConsumer* CreateAnalysisConsumer(CompilerInstance &CI,
+                                    const Preprocessor &pp,
                                     const std::string &output,
                                     AnalyzerOptionsRef opts,
                                     ArrayRef<std::string> plugins);

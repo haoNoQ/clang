@@ -2896,6 +2896,9 @@ CFGBlock *CFGBuilder::VisitCXXTryStmt(CXXTryStmt *Terminator) {
   // Add the terminator in the try block.
   NewTryTerminatedBlock->setTerminator(Terminator);
 
+  // no exception (default case)
+  addSuccessor(NewTryTerminatedBlock, TrySuccessor);
+
   bool HasCatchAll = false;
   for (unsigned h = 0; h <Terminator->getNumHandlers(); ++h) {
     // The code after the try is the implicit successor.
@@ -2913,14 +2916,17 @@ CFGBlock *CFGBuilder::VisitCXXTryStmt(CXXTryStmt *Terminator) {
     addSuccessor(NewTryTerminatedBlock, CatchBlock);
   }
   if (!HasCatchAll) {
-    if (PrevTryTerminatedBlock)
+    if (PrevTryTerminatedBlock) {
       addSuccessor(NewTryTerminatedBlock, PrevTryTerminatedBlock);
-    else
-      addSuccessor(NewTryTerminatedBlock, &cfg->getExit());
+    } else {
+      CFGBlock& E = cfg->getExit();
+      if (&E != TrySuccessor)
+        addSuccessor(NewTryTerminatedBlock, &E);
+    }
   }
 
-  // The code after the try is the implicit successor.
-  Succ = TrySuccessor;
+  // Try is the implicit successor.
+  Succ = NewTryTerminatedBlock;
 
   // Save the current "try" context.
   SaveAndRestore<CFGBlock*> save_try(TryTerminatedBlock, NewTryTerminatedBlock);

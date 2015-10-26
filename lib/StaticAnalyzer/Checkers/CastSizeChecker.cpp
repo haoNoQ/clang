@@ -55,7 +55,7 @@ void CastSizeChecker::checkPreStmt(const CastExpr *CE,CheckerContext &C) const {
 
   SValBuilder &svalBuilder = C.getSValBuilder();
   SVal extent = SR->getExtent(svalBuilder);
-  const llvm::APSInt *extentInt = svalBuilder.getKnownValue(state, extent);
+  const llvm::APSInt *extentInt = svalBuilder.getKnownIntValue(state, extent);
   if (!extentInt)
     return;
 

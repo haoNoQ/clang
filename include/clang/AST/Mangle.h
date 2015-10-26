@@ -77,6 +77,7 @@ private:
   ASTContext &Context;
   DiagnosticsEngine &Diags;
   const ManglerKind Kind;
+  bool ShouldForceMangleProto;
 
   llvm::DenseMap<const BlockDecl*, unsigned> GlobalBlockIds;
   llvm::DenseMap<const BlockDecl*, unsigned> LocalBlockIds;
@@ -87,7 +88,8 @@ public:
   explicit MangleContext(ASTContext &Context,
                          DiagnosticsEngine &Diags,
                          ManglerKind Kind)
-      : Context(Context), Diags(Diags), Kind(Kind) {}
+      : Context(Context), Diags(Diags), Kind(Kind),
+        ShouldForceMangleProto(false) {}
 
   virtual ~MangleContext() { }
 
@@ -105,6 +107,11 @@ public:
     return Result.first->second;
   }
   
+  bool shouldForceMangleProto() const { return ShouldForceMangleProto; }
+  void setShouldForceMangleProto(bool ForceMangleArguments) {
+    ShouldForceMangleProto = ForceMangleArguments;
+  }
+
   /// @name Mangler Entry Points
   /// @{
 

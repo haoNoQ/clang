@@ -55,13 +55,14 @@ IPAKind AnalyzerOptions::getIPAMode() {
             .Case("inlining", IPAK_Inlining)
             .Case("dynamic", IPAK_DynamicDispatch)
             .Case("dynamic-bifurcate", IPAK_DynamicDispatchBifurcate)
+            .Case("summary", IPAK_Summary)
             .Default(IPAK_NotSet);
     assert(IPAConfig != IPAK_NotSet && "IPA Mode is invalid.");
 
     // Set the member variable.
     IPAMode = IPAConfig;
   }
-  
+
   return IPAMode;
 }
 
@@ -72,7 +73,7 @@ AnalyzerOptions::mayInlineCXXMemberFunction(CXXInlineableMemberKind K) {
 
   if (!CXXMemberInliningMode) {
     static const char *ModeKey = "c++-inlining";
-    
+
     StringRef ModeStr(Config.GetOrCreateValue(ModeKey,
                                               "destructors").getValue());
 
@@ -187,7 +188,7 @@ int AnalyzerOptions::getOptionAsInteger(StringRef Name, int DefaultVal) {
   SmallString<10> StrBuf;
   llvm::raw_svector_ostream OS(StrBuf);
   OS << DefaultVal;
-  
+
   StringRef V(Config.GetOrCreateValue(Name, OS.str()).getValue());
   int Res = DefaultVal;
   bool b = V.getAsInteger(10, Res);
@@ -254,6 +255,20 @@ unsigned AnalyzerOptions::getMaxNodesPerTopLevelFunction() {
   return MaxNodesPerTopLevelFunction.getValue();
 }
 
+const StringRef &AnalyzerOptions::getCheckerOption(const StringRef &CheckerName,
+                                          const StringRef &OptionName,
+                                          const StringRef &DefaultValue) const {
+  CheckerOptionMap::const_iterator CheckerOpts =
+      CheckerSpecificOptions.find(CheckerName);
+  if (CheckerOpts == CheckerSpecificOptions.end())
+    return DefaultValue;
+  llvm::StringMap<llvm::StringRef>::const_iterator Option =
+      CheckerOpts->second.find(OptionName);
+  if (Option == CheckerOpts->second.end())
+    return DefaultValue;
+  return Option->second;
+}
+
 bool AnalyzerOptions::shouldSynthesizeBodies() {
   return getBooleanOption("faux-bodies", true);
 }
@@ -264,5 +279,9 @@ bool AnalyzerOptions::shouldPrunePaths() {
 
 bool AnalyzerOptions::shouldConditionalizeStaticInitializers() {
   return getBooleanOption("cfg-conditional-static-initializers", true);
+}
+
+bool AnalyzerOptions::shouldCollectSummaryStat() {
+  return getBooleanOption(CollectSummaryStat, "ipa-summary-stat", true);
 }
 

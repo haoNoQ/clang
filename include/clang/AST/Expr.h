@@ -252,6 +252,13 @@ public:
   bool isXValue() const { return getValueKind() == VK_XValue; }
   bool isGLValue() const { return getValueKind() != VK_RValue; }
 
+  enum SideEffectType {
+    SET_NoSideEffect,
+    SET_VolatileRead,
+    SET_FunctionCall,
+    SET_OtherSideEffect
+  };
+
   enum LValueClassification {
     LV_Valid,
     LV_NotObjectType,
@@ -567,6 +574,9 @@ public:
   bool EvaluateAsInt(llvm::APSInt &Result, const ASTContext &Ctx,
                      SideEffectsKind AllowSideEffects = SE_NoSideEffects) const;
 
+  bool EvaluateAsFloat(llvm::APFloat &Result, const ASTContext &Ctx,
+                     SideEffectsKind AllowSideEffects = SE_NoSideEffects) const;
+
   /// isEvaluatable - Call EvaluateAsRValue to see if this expression can be
   /// constant folded without side-effects, but discard the result.
   bool isEvaluatable(const ASTContext &Ctx) const;
@@ -574,7 +584,7 @@ public:
   /// HasSideEffects - This routine returns true for all those expressions
   /// which have any effect other than producing a value. Example is a function
   /// call, volatile variable read, or throwing an exception.
-  bool HasSideEffects(const ASTContext &Ctx) const;
+  SideEffectType HasSideEffects(const ASTContext &Ctx) const;
 
   /// \brief Determine whether this expression involves a call to any function
   /// that is not trivial.

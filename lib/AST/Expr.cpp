@@ -2788,9 +2788,9 @@ bool Expr::isConstantInitializer(ASTContext &Ctx, bool IsForRef) const {
   return isEvaluatable(Ctx);
 }
 
-bool Expr::HasSideEffects(const ASTContext &Ctx) const {
+Expr::SideEffectType Expr::HasSideEffects(const ASTContext &Ctx) const {
   if (isInstantiationDependent())
-    return true;
+    return SET_OtherSideEffect;
 
   switch (getStmtClass()) {
   case NoStmtClass:
@@ -2840,16 +2840,13 @@ bool Expr::HasSideEffects(const ASTContext &Ctx) const {
   case CXXUuidofExprClass:
   case OpaqueValueExprClass:
     // These never have a side-effect.
-    return false;
+    return SET_NoSideEffect;
 
-  case CallExprClass:
   case MSPropertyRefExprClass:
   case CompoundAssignOperatorClass:
   case VAArgExprClass:
   case AtomicExprClass:
   case StmtExprClass:
-  case CXXOperatorCallExprClass:
-  case CXXMemberCallExprClass:
   case UserDefinedLiteralClass:
   case CXXThrowExprClass:
   case CXXNewExprClass:
@@ -2859,7 +2856,7 @@ bool Expr::HasSideEffects(const ASTContext &Ctx) const {
   case BlockExprClass:
   case CUDAKernelCallExprClass:
     // These always have a side-effect.
-    return true;
+    return SET_OtherSideEffect;
 
   case ParenExprClass:
   case ArraySubscriptExprClass:
@@ -2880,21 +2877,28 @@ bool Expr::HasSideEffects(const ASTContext &Ctx) const {
     // These have a side-effect if any subexpression does.
     break;
 
+  case CallExprClass:
+  case CXXOperatorCallExprClass:
+  case CXXMemberCallExprClass:
+    return SET_FunctionCall;
+
   case UnaryOperatorClass:
     if (cast<UnaryOperator>(this)->isIncrementDecrementOp())
-      return true;
+      return SET_OtherSideEffect;
     break;
 
   case BinaryOperatorClass:
     if (cast<BinaryOperator>(this)->isAssignmentOp())
-      return true;
+      return SET_OtherSideEffect;
     break;
 
   case InitListExprClass:
     // FIXME: The children for an InitListExpr doesn't include the array filler.
-    if (const Expr *E = cast<InitListExpr>(this)->getArrayFiller())
-      if (E->HasSideEffects(Ctx))
-        return true;
+    if (const Expr *E = cast<InitListExpr>(this)->getArrayFiller()) {
+      SideEffectType EffectType = E->HasSideEffects(Ctx);
+      if (EffectType != SET_NoSideEffect)
+        return EffectType;
+    }
     break;
 
   case GenericSelectionExprClass:
@@ -2911,14 +2915,14 @@ bool Expr::HasSideEffects(const ASTContext &Ctx) const {
     if (const Expr *E = cast<CXXDefaultInitExpr>(this)->getExpr())
       return E->HasSideEffects(Ctx);
     // If we've not yet parsed the initializer, assume it has side-effects.
-    return true;
+    return SET_OtherSideEffect;
 
   case CXXDynamicCastExprClass: {
     // A dynamic_cast expression has side-effects if it can throw.
     const CXXDynamicCastExpr *DCE = cast<CXXDynamicCastExpr>(this);
     if (DCE->getTypeAsWritten()->isReferenceType() &&
         DCE->getCastKind() == CK_Dynamic)
-      return true;
+      return SET_OtherSideEffect;
   } // Fall through.
   case ImplicitCastExprClass:
   case CStyleCastExprClass:
@@ -2929,20 +2933,21 @@ bool Expr::HasSideEffects(const ASTContext &Ctx) const {
     const CastExpr *CE = cast<CastExpr>(this);
     if (CE->getCastKind() == CK_LValueToRValue &&
         CE->getSubExpr()->getType().isVolatileQualified())
-      return true;
+      return SET_VolatileRead;
     break;
   }
 
   case CXXTypeidExprClass:
     // typeid might throw if its subexpression is potentially-evaluated, so has
     // side-effects in that case whether or not its subexpression does.
-    return cast<CXXTypeidExpr>(this)->isPotentiallyEvaluated();
+    return cast<CXXTypeidExpr>(this)->isPotentiallyEvaluated()
+        ? SET_OtherSideEffect : SET_NoSideEffect;
 
   case CXXConstructExprClass:
   case CXXTemporaryObjectExprClass: {
     const CXXConstructExpr *CE = cast<CXXConstructExpr>(this);
     if (!CE->getConstructor()->isTrivial())
-      return true;
+      return SET_OtherSideEffect;
     // A trivial constructor does not add any side-effects of its own. Just look
     // at its arguments.
     break;
@@ -2955,8 +2960,8 @@ bool Expr::HasSideEffects(const ASTContext &Ctx) const {
       if (I->getCaptureKind() == LCK_ByCopy)
         // FIXME: Only has a side-effect if the variable is volatile or if
         // the copy would invoke a non-trivial copy constructor.
-        return true;
-    return false;
+        return SET_OtherSideEffect;
+    return SET_NoSideEffect;
   }
 
   case PseudoObjectExprClass: {
@@ -2970,9 +2975,9 @@ bool Expr::HasSideEffects(const ASTContext &Ctx) const {
       if (const OpaqueValueExpr *OVE = dyn_cast<OpaqueValueExpr>(Subexpr))
         Subexpr = OVE->getSourceExpr();
       if (Subexpr->HasSideEffects(Ctx))
-        return true;
+        return SET_OtherSideEffect;
     }
-    return false;
+    return SET_NoSideEffect;
   }
 
   case ObjCBoxedExprClass:
@@ -2987,16 +2992,16 @@ bool Expr::HasSideEffects(const ASTContext &Ctx) const {
   case ObjCSubscriptRefExprClass:
   case ObjCBridgedCastExprClass:
     // FIXME: Classify these cases better.
-    return true;
+    return SET_OtherSideEffect;
   }
 
   // Recurse to children.
   for (const_child_range SubStmts = children(); SubStmts; ++SubStmts)
     if (const Stmt *S = *SubStmts)
-      if (cast<Expr>(S)->HasSideEffects(Ctx))
-        return true;
+      if (SideEffectType Effect = cast<Expr>(S)->HasSideEffects(Ctx))
+        return Effect;
 
-  return false;
+  return SET_NoSideEffect;
 }
 
 namespace {

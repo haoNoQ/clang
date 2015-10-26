@@ -68,13 +68,15 @@ void ExprEngine::VisitBinaryOperator(const BinaryOperator* B,
         // SymSymExpr.
         unsigned Count = currBldrCtx->blockCount();
         if (LeftV.getAs<Loc>() &&
-            RHS->getType()->isIntegralOrEnumerationType() &&
+            (RHS->getType()->isIntegralOrEnumerationType() ||
+                RHS->getType()->isRealFloatingType()) &&
             RightV.isUnknown()) {
           RightV = svalBuilder.conjureSymbolVal(RHS, LCtx, RHS->getType(),
                                                 Count);
         }
         if (RightV.getAs<Loc>() &&
-            LHS->getType()->isIntegralOrEnumerationType() &&
+            (LHS->getType()->isIntegralOrEnumerationType() ||
+                LHS->getType()->isRealFloatingType()) &&
             LeftV.isUnknown()) {
           LeftV = svalBuilder.conjureSymbolVal(LHS, LCtx, LHS->getType(),
                                                Count);
@@ -315,8 +317,14 @@ void ExprEngine::VisitCast(const CastExpr *CastE, const Expr *Ex,
       case CK_LValueBitCast: {
         // Delegate to SValBuilder to process.
         SVal V = state->getSVal(Ex, LCtx);
-        V = svalBuilder.evalCast(V, T, ExTy);
-        state = state->BindExpr(CastE, LCtx, V);
+        if (T.getCanonicalType()->isIntegralOrEnumerationType() &&
+            ExTy.getCanonicalType()->isIntegralOrEnumerationType())
+          state = state->getConstraintManager().bindCastSVal(state, LCtx, CastE,
+                                                             V, T, ExTy);
+        else {
+          V = svalBuilder.evalCast(V, T, ExTy);
+          state = state->BindExpr(CastE, LCtx, V);
+        }
         Bldr.generateNode(CastE, Pred, state);
         continue;
       }
@@ -725,7 +733,8 @@ VisitUnaryExprOrTypeTraitExpr(const UnaryExprOrTypeTraitExpr *Ex,
       // the compiler has laid out its representation.  Just report Unknown
       // for these.
       return;
-    }
+    } else if (T->isIncompleteType())
+      return;
   }
   
   APSInt Value = Ex->EvaluateKnownConstInt(getContext());
@@ -849,11 +858,11 @@ void ExprEngine::VisitUnaryOperator(const UnaryOperator* U,
             Loc X = svalBuilder.makeNull();
             Result = evalBinOp(state, BO_EQ, *LV, X, U->getType());
           }
-          else if (Ex->getType()->isFloatingType()) {
+          else if (Ex->getType()->isRealFloatingType()) {
             // FIXME: handle floating point types.
             Result = UnknownVal();
           } else {
-            nonloc::ConcreteInt X(getBasicVals().getValue(0, Ex->getType()));
+            nonloc::ConcreteInt X(getBasicVals().getValue(0, Ex->getType()).getInt());
             Result = evalBinOp(state, BO_EQ, V.castAs<NonLoc>(), X,
                                U->getType());
           }

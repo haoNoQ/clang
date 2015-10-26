@@ -721,9 +721,140 @@ void CXXRecordDecl::addedMember(Decl *D) {
       data().DefaultedMoveAssignmentIsDeleted = true;
 
     if (const RecordType *RecordTy = T->getAs<RecordType>()) {
-      CXXRecordDecl* FieldRec = cast<CXXRecordDecl>(RecordTy->getDecl());
-      if (FieldRec->getDefinition()) {
-        addedClassSubobject(FieldRec);
+      RecordDecl *FieldRec = cast<RecordDecl>(RecordTy->getDecl());
+      // It may happen  that struct is not a CXXRecordDecl after it was imported
+      // from C++ ASTContext into C ASTContext
+      if (CXXRecordDecl* CXXFieldRec = dyn_cast<CXXRecordDecl>(FieldRec)) {
+        if (CXXFieldRec->getDefinition()) {
+          addedClassSubobject(CXXFieldRec);
+
+          // C++11 [class.ctor]p5, C++11 [class.copy]p11:
+          //   A defaulted [special member] for a class X is defined as
+          //   deleted if:
+          //    -- X is a union-like class that has a variant member with a
+          //       non-trivial [corresponding special member]
+          if (isUnion()) {
+            if (CXXFieldRec->hasNonTrivialMoveConstructor())
+              data().DefaultedMoveConstructorIsDeleted = true;
+            if (CXXFieldRec->hasNonTrivialMoveAssignment())
+              data().DefaultedMoveAssignmentIsDeleted = true;
+            if (CXXFieldRec->hasNonTrivialDestructor())
+              data().DefaultedDestructorIsDeleted = true;
+          }
+
+          // C++0x [class.ctor]p5:
+          //   A default constructor is trivial [...] if:
+          //    -- for all the non-static data members of its class that are of
+          //       class type (or array thereof), each such class has a trivial
+          //       default constructor.
+          if (!CXXFieldRec->hasTrivialDefaultConstructor())
+            data().HasTrivialSpecialMembers &= ~SMF_DefaultConstructor;
+
+          // C++0x [class.copy]p13:
+          //   A copy/move constructor for class X is trivial if [...]
+          //    [...]
+          //    -- for each non-static data member of X that is of class type (or
+          //       an array thereof), the constructor selected to copy/move that
+          //       member is trivial;
+          if (!CXXFieldRec->hasTrivialCopyConstructor())
+            data().HasTrivialSpecialMembers &= ~SMF_CopyConstructor;
+          // If the field doesn't have a simple move constructor, we'll eagerly
+          // declare the move constructor for this class and we'll decide whether
+          // it's trivial then.
+          if (!CXXFieldRec->hasTrivialMoveConstructor())
+            data().HasTrivialSpecialMembers &= ~SMF_MoveConstructor;
+
+          // C++0x [class.copy]p27:
+          //   A copy/move assignment operator for class X is trivial if [...]
+          //    [...]
+          //    -- for each non-static data member of X that is of class type (or
+          //       an array thereof), the assignment operator selected to
+          //       copy/move that member is trivial;
+          if (!CXXFieldRec->hasTrivialCopyAssignment())
+            data().HasTrivialSpecialMembers &= ~SMF_CopyAssignment;
+          // If the field doesn't have a simple move assignment, we'll eagerly
+          // declare the move assignment for this class and we'll decide whether
+          // it's trivial then.
+          if (!CXXFieldRec->hasTrivialMoveAssignment())
+            data().HasTrivialSpecialMembers &= ~SMF_MoveAssignment;
+
+          if (!CXXFieldRec->hasTrivialDestructor())
+            data().HasTrivialSpecialMembers &= ~SMF_Destructor;
+          if (!CXXFieldRec->hasIrrelevantDestructor())
+            data().HasIrrelevantDestructor = false;
+
+          // C++0x [class]p7:
+          //   A standard-layout class is a class that:
+          //    -- has no non-static data members of type non-standard-layout
+          //       class (or array of such types) [...]
+          if (!CXXFieldRec->isStandardLayout())
+            data().IsStandardLayout = false;
+
+          // C++0x [class]p7:
+          //   A standard-layout class is a class that:
+          //    [...]
+          //    -- has no base classes of the same type as the first non-static
+          //       data member.
+          // We don't want to expend bits in the state of the record decl
+          // tracking whether this is the first non-static data member so we
+          // cheat a bit and use some of the existing state: the empty bit.
+          // Virtual bases and virtual methods make a class non-empty, but they
+          // also make it non-standard-layout so we needn't check here.
+          // A non-empty base class may leave the class standard-layout, but not
+          // if we have arrived here, and have at least on non-static data
+          // member. If IsStandardLayout remains true, then the first non-static
+          // data member must come through here with Empty still true, and Empty
+          // will subsequently be set to false below.
+          if (data().IsStandardLayout && data().Empty) {
+            for (CXXRecordDecl::base_class_const_iterator BI = bases_begin(),
+                                                          BE = bases_end();
+                 BI != BE; ++BI) {
+              if (Context.hasSameUnqualifiedType(BI->getType(), T)) {
+                data().IsStandardLayout = false;
+                break;
+              }
+            }
+          }
+
+          // Keep track of the presence of mutable fields.
+          if (CXXFieldRec->hasMutableFields())
+            data().HasMutableFields = true;
+
+          // C++11 [class.copy]p13:
+          //   If the implicitly-defined constructor would satisfy the
+          //   requirements of a constexpr constructor, the implicitly-defined
+          //   constructor is constexpr.
+          // C++11 [dcl.constexpr]p4:
+          //    -- every constructor involved in initializing non-static data
+          //       members [...] shall be a constexpr constructor
+          if (!Field->hasInClassInitializer() &&
+              !CXXFieldRec->hasConstexprDefaultConstructor() && !isUnion())
+            // The standard requires any in-class initializer to be a constant
+            // expression. We consider this to be a defect.
+            data().DefaultedDefaultConstructorIsConstexpr = false;
+
+          // C++11 [class.copy]p8:
+          //   The implicitly-declared copy constructor for a class X will have
+          //   the form 'X::X(const X&)' if [...] for all the non-static data
+          //   members of X that are of a class type M (or array thereof), each
+          //   such class type has a copy constructor whose first parameter is
+          //   of type 'const M&' or 'const volatile M&'.
+          if (!CXXFieldRec->hasCopyConstructorWithConstParam())
+            data().ImplicitCopyConstructorHasConstParam = false;
+
+          // C++11 [class.copy]p18:
+          //   The implicitly-declared copy assignment oeprator for a class X will
+          //   have the form 'X& X::operator=(const X&)' if [...] for all the
+          //   non-static data members of X that are of a class type M (or array
+          //   thereof), each such class type has a copy assignment operator whose
+          //   parameter is of type 'const M&', 'const volatile M&' or 'M'.
+          if (!CXXFieldRec->hasCopyAssignmentWithConstParam())
+            data().ImplicitCopyAssignmentHasConstParam = false;
+
+          if (CXXFieldRec->hasUninitializedReferenceMember() &&
+              !Field->hasInClassInitializer())
+            data().HasUninitializedReferenceMember = true;
+        }
 
         // We may need to perform overload resolution to determine whether a
         // field can be moved if it's const or volatile qualified.
@@ -732,136 +863,10 @@ void CXXRecordDecl::addedMember(Decl *D) {
           data().NeedOverloadResolutionForMoveAssignment = true;
         }
 
-        // C++11 [class.ctor]p5, C++11 [class.copy]p11:
-        //   A defaulted [special member] for a class X is defined as
-        //   deleted if:
-        //    -- X is a union-like class that has a variant member with a
-        //       non-trivial [corresponding special member]
-        if (isUnion()) {
-          if (FieldRec->hasNonTrivialMoveConstructor())
-            data().DefaultedMoveConstructorIsDeleted = true;
-          if (FieldRec->hasNonTrivialMoveAssignment())
-            data().DefaultedMoveAssignmentIsDeleted = true;
-          if (FieldRec->hasNonTrivialDestructor())
-            data().DefaultedDestructorIsDeleted = true;
-        }
-
-        // C++0x [class.ctor]p5:
-        //   A default constructor is trivial [...] if:
-        //    -- for all the non-static data members of its class that are of
-        //       class type (or array thereof), each such class has a trivial
-        //       default constructor.
-        if (!FieldRec->hasTrivialDefaultConstructor())
-          data().HasTrivialSpecialMembers &= ~SMF_DefaultConstructor;
-
-        // C++0x [class.copy]p13:
-        //   A copy/move constructor for class X is trivial if [...]
-        //    [...]
-        //    -- for each non-static data member of X that is of class type (or
-        //       an array thereof), the constructor selected to copy/move that
-        //       member is trivial;
-        if (!FieldRec->hasTrivialCopyConstructor())
-          data().HasTrivialSpecialMembers &= ~SMF_CopyConstructor;
-        // If the field doesn't have a simple move constructor, we'll eagerly
-        // declare the move constructor for this class and we'll decide whether
-        // it's trivial then.
-        if (!FieldRec->hasTrivialMoveConstructor())
-          data().HasTrivialSpecialMembers &= ~SMF_MoveConstructor;
-
-        // C++0x [class.copy]p27:
-        //   A copy/move assignment operator for class X is trivial if [...]
-        //    [...]
-        //    -- for each non-static data member of X that is of class type (or
-        //       an array thereof), the assignment operator selected to
-        //       copy/move that member is trivial;
-        if (!FieldRec->hasTrivialCopyAssignment())
-          data().HasTrivialSpecialMembers &= ~SMF_CopyAssignment;
-        // If the field doesn't have a simple move assignment, we'll eagerly
-        // declare the move assignment for this class and we'll decide whether
-        // it's trivial then.
-        if (!FieldRec->hasTrivialMoveAssignment())
-          data().HasTrivialSpecialMembers &= ~SMF_MoveAssignment;
-
-        if (!FieldRec->hasTrivialDestructor())
-          data().HasTrivialSpecialMembers &= ~SMF_Destructor;
-        if (!FieldRec->hasIrrelevantDestructor())
-          data().HasIrrelevantDestructor = false;
         if (FieldRec->hasObjectMember())
           setHasObjectMember(true);
         if (FieldRec->hasVolatileMember())
           setHasVolatileMember(true);
-
-        // C++0x [class]p7:
-        //   A standard-layout class is a class that:
-        //    -- has no non-static data members of type non-standard-layout
-        //       class (or array of such types) [...]
-        if (!FieldRec->isStandardLayout())
-          data().IsStandardLayout = false;
-
-        // C++0x [class]p7:
-        //   A standard-layout class is a class that:
-        //    [...]
-        //    -- has no base classes of the same type as the first non-static
-        //       data member.
-        // We don't want to expend bits in the state of the record decl
-        // tracking whether this is the first non-static data member so we
-        // cheat a bit and use some of the existing state: the empty bit.
-        // Virtual bases and virtual methods make a class non-empty, but they
-        // also make it non-standard-layout so we needn't check here.
-        // A non-empty base class may leave the class standard-layout, but not
-        // if we have arrived here, and have at least on non-static data
-        // member. If IsStandardLayout remains true, then the first non-static
-        // data member must come through here with Empty still true, and Empty
-        // will subsequently be set to false below.
-        if (data().IsStandardLayout && data().Empty) {
-          for (CXXRecordDecl::base_class_const_iterator BI = bases_begin(),
-                                                        BE = bases_end();
-               BI != BE; ++BI) {
-            if (Context.hasSameUnqualifiedType(BI->getType(), T)) {
-              data().IsStandardLayout = false;
-              break;
-            }
-          }
-        }
-        
-        // Keep track of the presence of mutable fields.
-        if (FieldRec->hasMutableFields())
-          data().HasMutableFields = true;
-
-        // C++11 [class.copy]p13:
-        //   If the implicitly-defined constructor would satisfy the
-        //   requirements of a constexpr constructor, the implicitly-defined
-        //   constructor is constexpr.
-        // C++11 [dcl.constexpr]p4:
-        //    -- every constructor involved in initializing non-static data
-        //       members [...] shall be a constexpr constructor
-        if (!Field->hasInClassInitializer() &&
-            !FieldRec->hasConstexprDefaultConstructor() && !isUnion())
-          // The standard requires any in-class initializer to be a constant
-          // expression. We consider this to be a defect.
-          data().DefaultedDefaultConstructorIsConstexpr = false;
-
-        // C++11 [class.copy]p8:
-        //   The implicitly-declared copy constructor for a class X will have
-        //   the form 'X::X(const X&)' if [...] for all the non-static data
-        //   members of X that are of a class type M (or array thereof), each
-        //   such class type has a copy constructor whose first parameter is
-        //   of type 'const M&' or 'const volatile M&'.
-        if (!FieldRec->hasCopyConstructorWithConstParam())
-          data().ImplicitCopyConstructorHasConstParam = false;
-
-        // C++11 [class.copy]p18:
-        //   The implicitly-declared copy assignment oeprator for a class X will
-        //   have the form 'X& X::operator=(const X&)' if [...] for all the
-        //   non-static data members of X that are of a class type M (or array
-        //   thereof), each such class type has a copy assignment operator whose
-        //   parameter is of type 'const M&', 'const volatile M&' or 'M'.
-        if (!FieldRec->hasCopyAssignmentWithConstParam())
-          data().ImplicitCopyAssignmentHasConstParam = false;
-
-        if (FieldRec->hasUninitializedReferenceMember() &&
-            !Field->hasInClassInitializer())
-          data().HasUninitializedReferenceMember = true;
       }
     } else {
       // Base element type of field is a non-class type.

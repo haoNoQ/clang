@@ -8037,6 +8037,11 @@ static bool FastEvaluateAsRValue(const Expr *Exp, Expr::EvalResult &Result,
     IsConst = true;
     return true;
   }
+  if (const FloatingLiteral *L = dyn_cast<FloatingLiteral>(Exp)) {
+    Result.Val = APValue(L->getValue());
+    IsConst = true;
+    return true;
+  }
   
   // FIXME: Evaluating values of large array and record types can cause
   // performance problems. Only do so in C++11 for now.
@@ -8082,6 +8087,20 @@ bool Expr::EvaluateAsInt(APSInt &Result, const ASTContext &Ctx,
     return false;
 
   Result = ExprResult.Val.getInt();
+  return true;
+}
+bool Expr::EvaluateAsFloat(APFloat &Result, const ASTContext &Ctx,
+                         SideEffectsKind AllowSideEffects) const {
+
+  if (!getType()->isRealFloatingType())
+    return false;
+
+  EvalResult ExprResult;
+  if (!EvaluateAsRValue(ExprResult, Ctx) || !ExprResult.Val.isFloat() ||
+      (!AllowSideEffects && ExprResult.HasSideEffects))
+    return false;
+
+  Result = ExprResult.Val.getFloat();
   return true;
 }
 

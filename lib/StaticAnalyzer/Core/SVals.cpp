@@ -172,7 +172,8 @@ nonloc::CompoundVal::iterator nonloc::CompoundVal::end() const {
 //===----------------------------------------------------------------------===//
 
 bool SVal::isConstant() const {
-  return getAs<nonloc::ConcreteInt>() || getAs<loc::ConcreteInt>();
+  return getAs<nonloc::ConcreteInt>() || getAs<loc::ConcreteInt>() ||
+         getAs<nonloc::ConcreteFloat>();
 }
 
 bool SVal::isConstant(int I) const {
@@ -183,8 +184,16 @@ bool SVal::isConstant(int I) const {
   return false;
 }
 
+bool SVal::isConstant(double D) const {
+  if (Optional<nonloc::ConcreteFloat> NV = getAs<nonloc::ConcreteFloat>()) {
+    llvm::APFloat F(NV->getValue());
+    return F.compareWithConversion(llvm::APFloat(D)) == llvm::APFloat::cmpEqual;
+  }
+  return false;
+}
+
 bool SVal::isZeroConstant() const {
-  return isConstant(0);
+  return isConstant(0) || isConstant(0.0f) || isConstant(0.0);
 }
 
 
@@ -196,12 +205,25 @@ SVal nonloc::ConcreteInt::evalBinOp(SValBuilder &svalBuilder,
                                     BinaryOperator::Opcode Op,
                                     const nonloc::ConcreteInt& R) const {
   const llvm::APSInt* X =
-    svalBuilder.getBasicValueFactory().evalAPSInt(Op, getValue(), R.getValue());
+    &svalBuilder.getBasicValueFactory().evalAPSInt(Op, getValue(), R.getValue())->getInt();
 
   if (X)
     return nonloc::ConcreteInt(*X);
   else
     return UndefinedVal();
+}
+
+
+SVal nonloc::ConcreteFloat::evalBinOp(SValBuilder &svalBuilder,
+                                          BinaryOperator::Opcode Op,
+                                          const ConcreteFloat& R) const {
+  const llvm::APFloat* X =
+      &svalBuilder.getBasicValueFactory().evalAPFloat(Op, getValue(), R.getValue())->getFloat();
+
+    if (X)
+      return nonloc::ConcreteFloat(*X);
+    else
+      return UndefinedVal();
 }
 
 nonloc::ConcreteInt
@@ -214,6 +236,13 @@ nonloc::ConcreteInt::evalMinus(SValBuilder &svalBuilder) const {
   return svalBuilder.makeIntVal(-getValue());
 }
 
+nonloc::ConcreteFloat
+nonloc::ConcreteFloat::evalMinus(SValBuilder &svalBuilder) const {
+  llvm::APFloat val(getValue());
+  val.changeSign();
+  return svalBuilder.makeFloatVal(val);
+}
+
 //===----------------------------------------------------------------------===//
 // Transfer function dispatch for Locs.
 //===----------------------------------------------------------------------===//
@@ -224,7 +253,7 @@ SVal loc::ConcreteInt::evalBinOp(BasicValueFactory& BasicVals,
 
   assert(BinaryOperator::isComparisonOp(Op) || Op == BO_Sub);
 
-  const llvm::APSInt *X = BasicVals.evalAPSInt(Op, getValue(), R.getValue());
+  const llvm::APSInt *X = &BasicVals.evalAPSInt(Op, getValue(), R.getValue())->getInt();
 
   if (X)
     return nonloc::ConcreteInt(*X);
@@ -251,6 +280,9 @@ void SVal::dumpToStream(raw_ostream &os) const {
       break;
     case UndefinedKind:
       os << "Undefined";
+      break;
+    case TombstoneKind:
+      os << "Tombstone";
       break;
   }
 }
@@ -297,6 +329,17 @@ void NonLoc::dumpToStream(raw_ostream &os) const {
       os << "lazyCompoundVal{" << const_cast<void *>(C.getStore())
          << ',' << C.getRegion()
          << '}';
+      break;
+    }
+    case nonloc::ConcreteFloatKind: {
+      const nonloc::ConcreteFloat& C = castAs<nonloc::ConcreteFloat>();
+      SmallVector<char, 256> Buffer;
+      llvm::APFloat f = C.getValue();
+      bool losesInfo;
+      f.convert(llvm::APFloat::IEEEdouble,
+                llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+      f.toString(Buffer, 0, 0);
+      os << StringRef(Buffer.data(), Buffer.size());
       break;
     }
     default:

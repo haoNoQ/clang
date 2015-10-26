@@ -103,7 +103,6 @@ class EnvironmentManager {
 private:
   typedef Environment::BindingsTy::Factory FactoryTy;
   FactoryTy F;
-
 public:
   EnvironmentManager(llvm::BumpPtrAllocator& Allocator) : F(Allocator) {}
   ~EnvironmentManager() {}
@@ -114,7 +113,7 @@ public:
 
   /// Bind a symbolic value to the given environment entry.
   Environment bindExpr(Environment Env, const EnvironmentEntry &E, SVal V,
-                       bool Invalidate);
+                       bool Invalidate, SymbolManager &SM);
 
   Environment removeDeadBindings(Environment Env,
                                  SymbolReaper &SymReaper,

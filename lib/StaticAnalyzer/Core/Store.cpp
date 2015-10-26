@@ -48,17 +48,6 @@ const MemRegion *StoreManager::MakeElementRegion(const MemRegion *Base,
   return MRMgr.getElementRegion(EleTy, idx, Base, svalBuilder.getContext());
 }
 
-// FIXME: Merge with the implementation of the same method in MemRegion.cpp
-static bool IsCompleteType(ASTContext &Ctx, QualType Ty) {
-  if (const RecordType *RT = Ty->getAs<RecordType>()) {
-    const RecordDecl *D = RT->getDecl();
-    if (!D->getDefinition())
-      return false;
-  }
-
-  return true;
-}
-
 StoreRef StoreManager::BindDefault(Store store, const MemRegion *R, SVal V) {
   return StoreRef(store, *this);
 }
@@ -196,7 +185,7 @@ const MemRegion *StoreManager::castRegion(const MemRegion *R, QualType CastToTy)
       const MemRegion *newSuperR = 0;
 
       // We can only compute sizeof(PointeeTy) if it is a complete type.
-      if (IsCompleteType(Ctx, PointeeTy)) {
+      if (!PointeeTy->isIncompleteType()) {
         // Compute the size in **bytes**.
         CharUnits pointeeTySize = Ctx.getTypeSizeInChars(PointeeTy);
         if (!pointeeTySize.isZero()) {
@@ -442,7 +431,7 @@ SVal StoreManager::getLValueElement(QualType elementType, NonLoc Offset,
   // FIXME: For absolute pointer addresses, we just return that value back as
   //  well, although in reality we should return the offset added to that
   //  value.
-  if (Base.isUnknownOrUndef() || Base.getAs<loc::ConcreteInt>())
+  if (Base.isUnknownOrUndef() || Base.getAs<loc::ConcreteInt>() )
     return Base;
 
   const MemRegion* BaseRegion = Base.castAs<loc::MemRegionVal>().getRegion();
@@ -492,7 +481,7 @@ SVal StoreManager::getLValueElement(QualType elementType, NonLoc Offset,
 
   // Compute the new index.
   nonloc::ConcreteInt NewIdx(svalBuilder.getBasicValueFactory().getValue(BaseIdxI +
-                                                                    OffI));
+                                                                    OffI).getInt());
 
   // Construct the new ElementRegion.
   const MemRegion *ArrayR = ElemR->getSuperRegion();
@@ -502,10 +491,11 @@ SVal StoreManager::getLValueElement(QualType elementType, NonLoc Offset,
 
 StoreManager::BindingsHandler::~BindingsHandler() {}
 
-bool StoreManager::FindUniqueBinding::HandleBinding(StoreManager& SMgr,
+bool StoreManager::FindUniqueBinding::HandleBinding(StoreManager &SMgr,
                                                     Store store,
-                                                    const MemRegion* R,
-                                                    SVal val) {
+                                                    const MemRegion *R,
+                                                    uint64_t Offset, SVal val,
+                                                    bool Direct) {
   SymbolRef SymV = val.getAsLocSymbol();
   if (!SymV || SymV != Sym)
     return true;

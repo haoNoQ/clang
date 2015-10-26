@@ -48,10 +48,11 @@ public:
     UndefinedKind = 0,  // for subclass UndefinedVal (an uninitialized value)
     UnknownKind = 1,    // for subclass UnknownVal (a void value)
     LocKind = 2,        // for subclass Loc (an L-value)
-    NonLocKind = 3      // for subclass NonLoc (an R-value that's not
+    NonLocKind = 3,     // for subclass NonLoc (an R-value that's not
                         //   an L-value)
+    TombstoneKind = 4   // an invalid SVal for DenseMap
   };
-  enum { BaseBits = 2, BaseMask = 0x3 };
+  enum { BaseBits = 3, BaseMask = 0x7 };
 
 protected:
   const void *Data;
@@ -106,11 +107,15 @@ public:
     ID.AddPointer(Data);
   }
 
-  inline bool operator==(const SVal& R) const {
-    return getRawKind() == R.getRawKind() && Data == R.Data;
+  inline bool operator==(const SVal &R) const {
+    return Data == R.Data && getRawKind() == R.getRawKind();
   }
 
-  inline bool operator!=(const SVal& R) const {
+  inline bool operator<(const SVal &R) const {
+    return Data < R.Data || (Data == R.Data && getRawKind() < R.getRawKind());
+  }
+
+  inline bool operator!=(const SVal &R) const {
     return !(*this == R);
   }
 
@@ -133,6 +138,8 @@ public:
   bool isConstant() const;
 
   bool isConstant(int I) const;
+
+  bool isConstant(double D) const;
 
   bool isZeroConstant() const;
 
@@ -306,8 +313,9 @@ private:
 
 namespace nonloc {
 
-enum Kind { ConcreteIntKind, SymbolValKind,
-            LocAsIntegerKind, CompoundValKind, LazyCompoundValKind };
+enum Kind { ConcreteIntKind,  ConcreteFloatKind, SymbolValKind,
+            LocAsIntegerKind, CompoundValKind, LazyCompoundValKind
+             };
 
 /// \brief Represents symbolic expression.
 class SymbolVal : public NonLoc {
@@ -365,6 +373,33 @@ private:
   }
 };
 
+/// \brief Value representing floating constant.
+class ConcreteFloat : public NonLoc {
+public:
+  explicit
+  ConcreteFloat(const llvm::APFloat& V) : NonLoc(ConcreteFloatKind, &V) {}
+
+  const llvm::APFloat& getValue() const {
+    return *static_cast<const llvm::APFloat*>(Data);
+  }
+
+  // Transfer functions for binary/unary operations on ConcreteFloats.
+  SVal evalBinOp(SValBuilder &svalBuilder, BinaryOperator::Opcode Op,
+                 const ConcreteFloat& R) const;
+  ConcreteFloat evalMinus(SValBuilder &svalBuilder) const;
+private:
+  friend class SVal;
+  ConcreteFloat() {}
+  static bool isKind(const SVal& V) {
+    return V.getBaseKind() == NonLocKind &&
+           V.getSubKind() == ConcreteFloatKind;
+  }
+
+  static bool isKind(const NonLoc& V) {
+    return V.getSubKind() == ConcreteFloatKind;
+  }
+};
+
 class LocAsInteger : public NonLoc {
   friend class ento::SValBuilder;
 
@@ -391,7 +426,13 @@ public:
   unsigned getNumBits() const {
     const std::pair<SVal, uintptr_t> *D =
       static_cast<const std::pair<SVal, uintptr_t> *>(Data);
-    return D->second;
+    return D->second >> 1;
+  }
+
+  bool isSigned() const {
+    const std::pair<SVal, uintptr_t> *D =
+      static_cast<const std::pair<SVal, uintptr_t> *>(Data);
+    return D->second & 1;
   }
 
 private:
@@ -469,7 +510,7 @@ enum Kind { GotoLabelKind, MemRegionKind, ConcreteIntKind };
 
 class GotoLabel : public Loc {
 public:
-  explicit GotoLabel(LabelDecl *Label) : Loc(GotoLabelKind, Label) {}
+  explicit GotoLabel(const LabelDecl *Label) : Loc(GotoLabelKind, Label) {}
 
   const LabelDecl *getLabel() const {
     return static_cast<const LabelDecl*>(Data);
@@ -553,6 +594,17 @@ private:
 
 } // end ento::loc namespace
 
+class TombstoneVal : public SVal {
+public:
+  TombstoneVal() : SVal(TombstoneKind) {}
+
+private:
+  friend class SVal;
+  static bool isKind(const SVal &V) {
+    return V.getBaseKind() == TombstoneKind;
+  }
+};
+
 } // end ento namespace
 
 } // end clang namespace
@@ -563,6 +615,29 @@ static inline raw_ostream &operator<<(raw_ostream &os,
   V.dumpToStream(os);
   return os;
 }
+
+// Traits specialization for DenseMap
+template <> struct DenseMapInfo<clang::ento::SVal> {
+
+  static inline clang::ento::SVal getEmptyKey() {
+    return clang::ento::UnknownVal();
+  }
+
+  static inline clang::ento::SVal getTombstoneKey() {
+    return clang::ento::TombstoneVal();
+  }
+
+  static unsigned getHashValue(const clang::ento::SVal &V) {
+    llvm::FoldingSetNodeID ID;
+    V.Profile(ID);
+    return ID.ComputeHash();
+  }
+
+  static bool isEqual(const clang::ento::SVal &L,
+                      const clang::ento::SVal &R) {
+    return L == R;
+  }
+};
 
 template <typename T> struct isPodLike;
 template <> struct isPodLike<clang::ento::SVal> {

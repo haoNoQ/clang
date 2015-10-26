@@ -824,10 +824,11 @@ void test_for_jumps() {
 }
 
 // CHECK:      [B3 (ENTRY)]
-// CHECK-NEXT:   Succs (1): B0
+// CHECK-NEXT:   Succs (1): B1
 // CHECK:      [B1]
 // CHECK-NEXT:   T: try ...
-// CHECK-NEXT:   Succs (2): B2 B0
+// CHECK-NEXT:   Preds (1): B3
+// CHECK-NEXT:   Succs (2): B0 B2
 // CHECK:      [B2]
 // CHECK-NEXT:  catch (const A &e):
 // CHECK-NEXT:   1: catch (const A &e) {
@@ -835,7 +836,7 @@ void test_for_jumps() {
 // CHECK-NEXT:   Preds (1): B1
 // CHECK-NEXT:   Succs (1): B0
 // CHECK:      [B0 (EXIT)]
-// CHECK-NEXT:   Preds (3): B2 B1 B3
+// CHECK-NEXT:   Preds (2): B1 B2
 void test_catch_const_ref() {
   try {
   } catch (const A& e) {
@@ -843,10 +844,11 @@ void test_catch_const_ref() {
 }
 
 // CHECK:      [B3 (ENTRY)]
-// CHECK-NEXT:   Succs (1): B0
+// CHECK-NEXT:   Succs (1): B1
 // CHECK:      [B1]
 // CHECK-NEXT:   T: try ...
-// CHECK-NEXT:   Succs (2): B2 B0
+// CHECK-NEXT:   Preds (1): B3
+// CHECK-NEXT:   Succs (2): B0 B2
 // CHECK:      [B2]
 // CHECK-NEXT:  catch (A e):
 // CHECK-NEXT:   1: catch (A e) {
@@ -855,7 +857,7 @@ void test_catch_const_ref() {
 // CHECK-NEXT:   Preds (1): B1
 // CHECK-NEXT:   Succs (1): B0
 // CHECK:      [B0 (EXIT)]
-// CHECK-NEXT:   Preds (3): B2 B1 B3
+// CHECK-NEXT:   Preds (2): B1 B2
 void test_catch_copy() {
   try {
   } catch (A e) {

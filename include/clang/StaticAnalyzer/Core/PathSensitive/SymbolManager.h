@@ -24,6 +24,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/Support/DataTypes.h"
+#include "map"
 
 namespace llvm {
 class BumpPtrAllocator;
@@ -39,6 +40,7 @@ namespace ento {
   class SubRegion;
   class TypedValueRegion;
   class VarRegion;
+  class SymbolicRegion;
 
 /// \brief Symbolic value. These values used to capture symbolic execution of
 /// the program.
@@ -46,10 +48,10 @@ class SymExpr : public llvm::FoldingSetNode {
   virtual void anchor();
 public:
   enum Kind { RegionValueKind, ConjuredKind, DerivedKind, ExtentKind,
-              MetadataKind,
+              MetadataKind, RegionAddressKind, LabelAddressKind,
               BEGIN_SYMBOLS = RegionValueKind,
-              END_SYMBOLS = MetadataKind,
-              SymIntKind, IntSymKind, SymSymKind,
+              END_SYMBOLS = LabelAddressKind,
+              SymIntKind, IntSymKind, SymFloatKind, FloatSymKind, SymSymKind,
               BEGIN_BINARYSYMEXPRS = SymIntKind,
               END_BINARYSYMEXPRS = SymSymKind,
               CastSymbolKind };
@@ -308,6 +310,64 @@ public:
   }
 };
 
+/// \brief Represents a variable address expression like '&a'.
+class SymbolRegionAddress : public SymbolData {
+  const MemRegion *const Reg;
+
+public:
+  SymbolRegionAddress(SymbolID sym, const MemRegion *reg)
+      : SymbolData(RegionAddressKind, sym), Reg(reg) {}
+
+  const MemRegion *getRegion() const { return Reg; }
+
+  QualType getType() const;
+
+  virtual void dumpToStream(raw_ostream &os) const;
+
+  static void Profile(llvm::FoldingSetNodeID &ID, const MemRegion *reg) {
+    ID.AddInteger((unsigned) RegionAddressKind);
+    ID.AddPointer(reg);
+  }
+
+  virtual void Profile(llvm::FoldingSetNodeID &ID) {
+    Profile(ID, Reg);
+  }
+
+  // Implement isa<T> support.
+  static inline bool classof(const SymExpr *SE) {
+    return SE->getKind() == RegionAddressKind;
+  }
+};
+
+/// \brief Represents a numeric value of a label pointer
+class SymbolLabelAddress : public SymbolData {
+  const LabelDecl *const LD;
+
+public:
+  SymbolLabelAddress(SymbolID sym, const LabelDecl *ld)
+      : SymbolData(LabelAddressKind, sym), LD(ld) {}
+
+  const LabelDecl *getLabel() const { return LD; }
+
+  QualType getType() const;
+
+  virtual void dumpToStream(raw_ostream &os) const;
+
+  static void Profile(llvm::FoldingSetNodeID &ID, const LabelDecl *ld) {
+    ID.AddInteger((unsigned) LabelAddressKind);
+    ID.AddPointer(ld);
+  }
+
+  virtual void Profile(llvm::FoldingSetNodeID &ID) {
+    Profile(ID, LD);
+  }
+
+  // Implement isa<T> support.
+  static inline bool classof(const SymExpr *SE) {
+    return SE->getKind() == LabelAddressKind;
+  }
+};
+
 /// \brief Represents a cast expression.
 class SymbolCast : public SymExpr {
   const SymExpr *Operand;
@@ -437,6 +497,76 @@ public:
   }
 };
 
+/// \brief Represents a symbolic expression like 'x' + 3.0.
+class SymFloatExpr : public BinarySymExpr {
+  const SymExpr *LHS;
+  const llvm::APFloat& RHS;
+
+public:
+  SymFloatExpr(const SymExpr *lhs, BinaryOperator::Opcode op,
+             const llvm::APFloat& rhs, QualType t)
+    : BinarySymExpr(SymFloatKind, op, t), LHS(lhs), RHS(rhs) {}
+
+  virtual void dumpToStream(raw_ostream &os) const;
+
+  const SymExpr *getLHS() const { return LHS; }
+  const llvm::APFloat &getRHS() const { return RHS; }
+
+  static void Profile(llvm::FoldingSetNodeID& ID, const SymExpr *lhs,
+                      BinaryOperator::Opcode op, const llvm::APFloat& rhs,
+                      QualType t) {
+    ID.AddInteger((unsigned) SymFloatKind);
+    ID.AddPointer(lhs);
+    ID.AddInteger(op);
+    ID.AddPointer(&rhs);
+    ID.Add(t);
+  }
+
+  void Profile(llvm::FoldingSetNodeID& ID) {
+    Profile(ID, LHS, getOpcode(), RHS, getType());
+  }
+
+  // Implement isa<T> support.
+  static inline bool classof(const SymExpr *SE) {
+    return SE->getKind() == SymFloatKind;
+  }
+};
+
+/// \brief Represents a symbolic expression like 3.0 - 'x'.
+class FloatSymExpr : public BinarySymExpr {
+  const llvm::APFloat& LHS;
+  const SymExpr *RHS;
+
+public:
+  FloatSymExpr(const llvm::APFloat& lhs, BinaryOperator::Opcode op,
+             const SymExpr *rhs, QualType t)
+    : BinarySymExpr(FloatSymKind, op, t), LHS(lhs), RHS(rhs) {}
+
+  virtual void dumpToStream(raw_ostream &os) const;
+
+  const SymExpr *getRHS() const { return RHS; }
+  const llvm::APFloat &getLHS() const { return LHS; }
+
+  static void Profile(llvm::FoldingSetNodeID& ID, const llvm::APFloat& lhs,
+                      BinaryOperator::Opcode op, const SymExpr *rhs,
+                      QualType t) {
+    ID.AddInteger((unsigned) FloatSymKind);
+    ID.AddPointer(&lhs);
+    ID.AddInteger(op);
+    ID.AddPointer(rhs);
+    ID.Add(t);
+  }
+
+  void Profile(llvm::FoldingSetNodeID& ID) {
+    Profile(ID, LHS, getOpcode(), RHS, getType());
+  }
+
+  // Implement isa<T> support.
+  static inline bool classof(const SymExpr *SE) {
+    return SE->getKind() == FloatSymKind;
+  }
+};
+
 /// \brief Represents a symbolic expression like 'x' + 'y'.
 class SymSymExpr : public BinarySymExpr {
   const SymExpr *LHS;
@@ -474,6 +604,7 @@ public:
 class SymbolManager {
   typedef llvm::FoldingSet<SymExpr> DataSetTy;
   typedef llvm::DenseMap<SymbolRef, SymbolRefSmallVectorTy*> SymbolDependTy;
+  typedef std::multimap<SymbolRef, SymbolRef> CastSetTy;
 
   DataSetTy DataSet;
   /// Stores the extra dependencies between symbols: the data should be kept
@@ -483,14 +614,35 @@ class SymbolManager {
   llvm::BumpPtrAllocator& BPAlloc;
   BasicValueFactory &BV;
   ASTContext &Ctx;
+  CastSetTy CastSet;
+
+  bool CastSetContain(SymbolRef BaseSym, SymbolRef CastSym) {
+    CastSetItPair range = CastSet.equal_range(BaseSym);
+    for (CastSetIt i = range.first, e = range.second; i != e; ++i)
+      if ((*i).second == CastSym)
+        return true;
+
+    return false;
+  }
 
 public:
+  typedef CastSetTy::const_iterator CastSetIt;
+  typedef std::pair <CastSetIt, CastSetIt> CastSetItPair;
   SymbolManager(ASTContext &ctx, BasicValueFactory &bv,
                 llvm::BumpPtrAllocator& bpalloc)
     : SymbolDependencies(16), SymbolCounter(0),
       BPAlloc(bpalloc), BV(bv), Ctx(ctx) {}
 
   ~SymbolManager();
+
+  void addCast(SymbolRef BaseSym, SymbolRef CastSym) {
+    if (!CastSetContain(BaseSym, CastSym))
+      CastSet.insert(std::pair<SymbolRef, SymbolRef>(BaseSym, CastSym));
+  }
+
+  std::pair <CastSetIt, CastSetIt> getCastSetIt() {
+    return std::pair <CastSetIt, CastSetIt>(CastSet.begin(), CastSet.end());
+  }
 
   static bool canSymbolicate(QualType T);
 
@@ -523,6 +675,10 @@ public:
                                           QualType T, unsigned VisitCount,
                                           const void *SymbolTag = 0);
 
+  const SymbolRegionAddress *getRegionAddressSymbol(const MemRegion *reg);
+
+  const SymbolLabelAddress *getLabelAddressSymbol(const LabelDecl *ld);
+
   const SymbolCast* getCastSymbol(const SymExpr *Operand,
                                   QualType From, QualType To);
 
@@ -535,6 +691,18 @@ public:
   }
 
   const IntSymExpr *getIntSymExpr(const llvm::APSInt& lhs,
+                                  BinaryOperator::Opcode op,
+                                  const SymExpr *rhs, QualType t);
+
+  const SymFloatExpr *getSymFloatExpr(const SymExpr *lhs, BinaryOperator::Opcode op,
+                                  const llvm::APFloat& rhs, QualType t);
+
+  const SymFloatExpr *getSymFloatExpr(const SymExpr &lhs, BinaryOperator::Opcode op,
+                                  const llvm::APFloat& rhs, QualType t) {
+    return getSymFloatExpr(&lhs, op, rhs, t);
+  }
+
+  const FloatSymExpr *getFloatSymExpr(const llvm::APFloat& lhs,
                                   BinaryOperator::Opcode op,
                                   const SymExpr *rhs, QualType t);
 

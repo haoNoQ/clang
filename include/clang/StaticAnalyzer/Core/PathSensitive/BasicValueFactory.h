@@ -32,6 +32,8 @@ public:
   CompoundValData(QualType t, llvm::ImmutableList<SVal> l)
     : T(t), L(l) {}
 
+  QualType getType() const { return T; }
+
   typedef llvm::ImmutableList<SVal>::iterator iterator;
   iterator begin() const { return L.begin(); }
   iterator end() const { return L.end(); }
@@ -60,15 +62,15 @@ public:
 };
 
 class BasicValueFactory {
-  typedef llvm::FoldingSet<llvm::FoldingSetNodeWrapper<llvm::APSInt> >
-          APSIntSetTy;
+  typedef llvm::FoldingSet<llvm::FoldingSetNodeWrapper<APValue> >
+          APValueSetTy;
 
   ASTContext &Ctx;
-  llvm::BumpPtrAllocator& BPAlloc;
+  llvm::BumpPtrAllocator BPAlloc;
 
-  APSIntSetTy   APSIntSet;
+  APValueSetTy   APValueSet;
+
   void *        PersistentSVals;
-  void *        PersistentSValPairs;
 
   llvm::ImmutableList<SVal>::Factory SValListFactory;
   llvm::FoldingSet<CompoundValData>  CompoundValDataSet;
@@ -76,20 +78,23 @@ class BasicValueFactory {
 
   // This is private because external clients should use the factory
   // method that takes a QualType.
-  const llvm::APSInt& getValue(uint64_t X, unsigned BitWidth, bool isUnsigned);
+  const APValue& getValue(uint64_t X, unsigned BitWidth, bool isUnsigned);
 
 public:
-  BasicValueFactory(ASTContext &ctx, llvm::BumpPtrAllocator& Alloc)
-  : Ctx(ctx), BPAlloc(Alloc), PersistentSVals(0), PersistentSValPairs(0),
-    SValListFactory(Alloc) {}
+  BasicValueFactory(ASTContext &ctx)
+  : Ctx(ctx), PersistentSVals(0), SValListFactory(BPAlloc) {}
 
   ~BasicValueFactory();
 
   ASTContext &getContext() const { return Ctx; }
 
-  const llvm::APSInt& getValue(const llvm::APSInt& X);
-  const llvm::APSInt& getValue(const llvm::APInt& X, bool isUnsigned);
-  const llvm::APSInt& getValue(uint64_t X, QualType T);
+  llvm::BumpPtrAllocator &getAllocator() { return BPAlloc; }
+
+  const APValue& getValue(const llvm::APSInt& X);
+  const APValue& getValue(const llvm::APInt& X, bool isUnsigned);
+  const APValue& getValue(uint64_t X, QualType T);
+  const APValue& getValue(const llvm::APFloat& X);
+  const APValue& getValue(const APValue& X);
 
   /// Returns the type of the APSInt used to store values of the given QualType.
   APSIntType getAPSIntType(QualType T) const {
@@ -100,69 +105,96 @@ public:
 
   /// Convert - Create a new persistent APSInt with the same value as 'From'
   ///  but with the bitwidth and signedness of 'To'.
-  const llvm::APSInt &Convert(const llvm::APSInt& To,
+  const APValue &Convert(const llvm::APSInt& To,
                               const llvm::APSInt& From) {
     APSIntType TargetType(To);
     if (TargetType == APSIntType(From))
-      return From;
+      return getValue(From);
 
     return getValue(TargetType.convert(From));
   }
   
-  const llvm::APSInt &Convert(QualType T, const llvm::APSInt &From) {
+  const APValue &Convert(QualType T, const llvm::APSInt &From) {
+    if (T->isRealFloatingType()) {
+      llvm::APFloat val(0.0);
+      val.convertFromAPInt(From, true, llvm::APFloat::rmNearestTiesToEven);
+
+      return getValue(val);
+    }
     APSIntType TargetType = getAPSIntType(T);
     if (TargetType == APSIntType(From))
-      return From;
+      return getValue(From);
     
     return getValue(TargetType.convert(From));
   }
 
   const llvm::APSInt& getIntValue(uint64_t X, bool isUnsigned) {
     QualType T = isUnsigned ? Ctx.UnsignedIntTy : Ctx.IntTy;
-    return getValue(X, T);
+    return getValue(X, T).getInt();
   }
 
-  inline const llvm::APSInt& getMaxValue(const llvm::APSInt &v) {
-    return getValue(APSIntType(v).getMaxValue());
+  inline const APValue& getMaxValue(const APValue &v) {
+    if (v.isInt())
+      return getValue(APSIntType(v.getInt()).getMaxValue());
+    else if (v.isFloat())
+      return getValue(v.getFloat().getLargest(v.getFloat().getSemantics(), false));
+    else {
+      llvm_unreachable("Only int and float types are supported");
+    }
   }
 
-  inline const llvm::APSInt& getMinValue(const llvm::APSInt &v) {
-    return getValue(APSIntType(v).getMinValue());
+  inline const APValue& getMinValue(const APValue &v) {
+    if (v.isInt())
+      return getValue(APSIntType(v.getInt()).getMinValue());
+    else if (v.isFloat())
+      return getValue(v.getFloat().getLargest(v.getFloat().getSemantics(), true));
+    else {
+      llvm_unreachable("Only int and float types are supported");
+    }
   }
 
-  inline const llvm::APSInt& getMaxValue(QualType T) {
+  inline const APValue& getMaxValue(QualType T) {
+    if (T->isRealFloatingType()) {
+      llvm::APFloat val(0.0);
+      return getValue(val.getLargest(Ctx.getFloatTypeSemantics(T), false));
+    }
     return getValue(getAPSIntType(T).getMaxValue());
   }
 
-  inline const llvm::APSInt& getMinValue(QualType T) {
+  inline const APValue& getMinValue(QualType T) {
+    if (T->isRealFloatingType()) {
+      llvm::APFloat val(0.0);
+      return getValue(val.getLargest(Ctx.getFloatTypeSemantics(T), true));
+    }
     return getValue(getAPSIntType(T).getMinValue());
   }
 
-  inline const llvm::APSInt& Add1(const llvm::APSInt& V) {
+  inline const APValue& Add1(const llvm::APSInt& V) {
     llvm::APSInt X = V;
     ++X;
     return getValue(X);
   }
 
-  inline const llvm::APSInt& Sub1(const llvm::APSInt& V) {
+  inline const APValue& Sub1(const llvm::APSInt& V) {
     llvm::APSInt X = V;
     --X;
     return getValue(X);
   }
 
-  inline const llvm::APSInt& getZeroWithPtrWidth(bool isUnsigned = true) {
+  inline const APValue& getZeroWithPtrWidth(bool isUnsigned = true) {
     return getValue(0, Ctx.getTypeSize(Ctx.VoidPtrTy), isUnsigned);
   }
 
-  inline const llvm::APSInt &getIntWithPtrWidth(uint64_t X, bool isUnsigned) {
+  inline const APValue &getIntWithPtrWidth(uint64_t X, bool isUnsigned) {
     return getValue(X, Ctx.getTypeSize(Ctx.VoidPtrTy), isUnsigned);
   }
 
-  inline const llvm::APSInt& getTruthValue(bool b, QualType T) {
-    return getValue(b ? 1 : 0, Ctx.getTypeSize(T), false);
+  inline const APValue& getTruthValue(bool b, QualType T) {
+    return getValue(b ? 1 : 0, Ctx.getTypeSize(T),
+                    T->isUnsignedIntegerOrEnumerationType());
   }
 
-  inline const llvm::APSInt& getTruthValue(bool b) {
+  inline const APValue& getTruthValue(bool b) {
     return getTruthValue(b, Ctx.getLogicalOperationType());
   }
 
@@ -180,17 +212,14 @@ public:
     return SValListFactory.add(X, L);
   }
 
-  const llvm::APSInt* evalAPSInt(BinaryOperator::Opcode Op,
+  const APValue* evalAPSInt(BinaryOperator::Opcode Op,
                                      const llvm::APSInt& V1,
                                      const llvm::APSInt& V2);
-
+  const APValue* evalAPFloat(BinaryOperator::Opcode Op,
+                               const llvm::APFloat& V1,
+                               const llvm::APFloat& V2);
   const std::pair<SVal, uintptr_t>&
   getPersistentSValWithData(const SVal& V, uintptr_t Data);
-
-  const std::pair<SVal, SVal>&
-  getPersistentSValPair(const SVal& V1, const SVal& V2);
-
-  const SVal* getPersistentSVal(SVal X);
 };
 
 } // end GR namespace

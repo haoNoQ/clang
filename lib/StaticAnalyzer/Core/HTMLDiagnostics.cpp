@@ -39,6 +39,174 @@ class HTMLDiagnostics : public PathDiagnosticConsumer {
   std::string Directory;
   bool createdDir, noDir;
   const Preprocessor &PP;
+  // Mapping from Bug Source File(FileID) to Report Name(std::string)
+  std::map<int, std::string> FileIDPathMap;
+  void addToFileIDPathMap(int ID, std::string Path) {
+    FileIDPathMap[ID] = Path;
+  }
+  std::string getFromFileIDPathMap(int ID) { return FileIDPathMap[ID]; }
+  // Mapping from Bug Source File(FileID) to Report File Rewriter(Rewriter)
+  std::map<FileID, Rewriter *> FileIDRewriterMap;
+
+  std::string getNxtEventFile(const PathDiagnosticPiece &P,
+                              const PathPieces &path);
+
+  Rewriter *PrepareReportFile(FileID FID, const SourceManager &SMgr,
+                              bool isMainReportFile) {
+
+    // Create a new rewriter to generate HTML.
+    if (Rewriter *R = FileIDRewriterMap[FID])
+      return R;
+    SmallString<128> Model, ResultPath;
+    llvm::sys::path::append(Model, Directory, isMainReportFile
+                                                  ? "report-%%%%%%.html"
+                                                  : "helper-%%%%%%.html");
+    int fd;
+    llvm::sys::fs::createUniqueFile(Model.str(), fd, ResultPath);
+    addToFileIDPathMap(FID.getHashValue(), ResultPath.str());
+    // Create a Rewriter to write to this html
+    Rewriter *R =
+        new Rewriter(const_cast<SourceManager &>(SMgr), PP.getLangOpts());
+    FileIDRewriterMap[FID] = R;
+    return R;
+  }
+
+  void sourceCodeListing(FileID FID, Rewriter &R) {
+    html::EscapeText(R, FID);
+    html::AddLineNumbers(R, FID);
+    html::SyntaxHighlight(R, FID, PP);
+    html::HighlightMacros(R, FID, PP);
+  }
+
+  void emitHtml(FileID FID, Rewriter &R) {
+    // Get the rewrite buffer.
+    const RewriteBuffer *Buf = R.getRewriteBufferFor(FID);
+
+    if (!Buf) {
+      llvm::errs() << "warning: no diagnostics generated for main file.\n";
+      return;
+    }
+
+    std::string ErrorMsg;
+    llvm::raw_fd_ostream os1(getFromFileIDPathMap(FID.getHashValue()).c_str(),
+                             ErrorMsg);
+    // Emit the HTML to disk.
+    for (RewriteBuffer::iterator I = Buf->begin(), E = Buf->end(); I != E; ++I)
+      os1 << *I;
+  }
+
+  void addHeader(FileID FID, Rewriter &R) {
+    const SourceManager &SrcMgr = R.getSourceMgr();
+    const FileEntry *Entry = SrcMgr.getFileEntryForID(FID);
+    html::AddHeaderFooterInternalBuiltinCSS(R, FID, Entry->getName());
+  }
+
+  void makeMainReportFile(const PathPieces &path,
+                          const PathDiagnostic &D) {
+    FileID MainReportFileFID =
+     (*path.rbegin())->getLocation().asLocation().getExpansionLoc().getFileID();
+    Rewriter &R = *FileIDRewriterMap[MainReportFileFID];
+    sourceCodeListing(MainReportFileFID, R);
+    addSomeMetaToMainReportFile(path, D);
+    addHeader(MainReportFileFID, R);
+    emitHtml(MainReportFileFID, R);
+    FileIDRewriterMap.erase(FileIDRewriterMap.find(MainReportFileFID));
+    FileIDPathMap.erase(FileIDPathMap.find(MainReportFileFID.getHashValue()));
+  }
+
+  void makeHelperFile(FileID FID, const PathPieces &path,
+                       const PathDiagnostic &D) {
+    Rewriter &R = *FileIDRewriterMap[FID];
+    sourceCodeListing(FID, R);
+    addHeader(FID, R);
+    emitHtml(FID, R);
+  }
+
+  void addSomeMetaToMainReportFile(const PathPieces &path,
+                                   const PathDiagnostic &D) {
+    // Add the name of the file as an <h1> tag.
+    FullSourceLoc MainReportFileFSL =
+        (*path.rbegin())->getLocation().asLocation().getExpansionLoc();
+
+    const FileID FID = MainReportFileFSL.getFileID();
+    Rewriter *R = FileIDRewriterMap[FID];
+    const SourceManager &SMgr = R->getSourceMgr();
+    const FileEntry *MainReportEntry = SMgr.getFileEntryForID(FID);
+    llvm::SmallString<0> DirName;
+
+    if (llvm::sys::path::is_relative(MainReportEntry->getName())) {
+      llvm::sys::fs::current_path(DirName);
+      DirName += '/';
+    }
+    {
+      std::string endFile =
+          getFromFileIDPathMap(MainReportFileFSL.getFileID().getHashValue());
+      size_t fileIndex = endFile.find_last_of("/");
+      if (fileIndex != std::string::npos)
+        endFile = endFile.substr(fileIndex + 1);
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      os << "<!-- REPORTHEADER -->\n"
+         << "<h3>Bug Summary</h3>\n<table class=\"simpletable\">\n"
+            "<tr><td class=\"rowname\">File:</td><td>"
+         << html::EscapeText(DirName)
+         << html::EscapeText(MainReportEntry->getName())
+         << "</td></tr>\n<tr><td class=\"rowname\">Location:</td><td>"
+         << "<a href=" << endFile << "#EndPath" << ">line "
+         << MainReportFileFSL.getExpansionLineNumber() << ", column "
+         << MainReportFileFSL.getExpansionColumnNumber()
+         << "</a></td></tr>\n<tr><td class=\"rowname\">Description:</td><td>"
+         << D.getVerboseDescription() << "</td></tr>\n";
+
+      // Output any other meta data.
+
+      for (PathDiagnostic::meta_iterator I = D.meta_begin(), E = D.meta_end();
+           I != E; ++I) {
+        os << "<tr><td></td><td>" << html::EscapeText(*I) << "</td></tr>\n";
+      }
+
+      os << "</table>\n<!-- REPORTSUMMARYEXTRA -->\n"
+            "<h3>Annotated Source Code</h3>\n";
+
+      R->InsertTextBefore(SMgr.getLocForStartOfFile(FID), os.str());
+    }
+
+    // Embed meta-data tags.
+    {
+      std::string s;
+      llvm::raw_string_ostream os(s);
+
+      StringRef BugDesc = D.getVerboseDescription();
+      if (!BugDesc.empty())
+        os << "\n<!-- BUGDESC " << BugDesc << " -->\n";
+
+      StringRef BugType = D.getBugType();
+      if (!BugType.empty())
+        os << "\n<!-- BUGTYPE " << BugType << " -->\n";
+
+      StringRef BugCategory = D.getCategory();
+      if (!BugCategory.empty())
+        os << "\n<!-- BUGCATEGORY " << BugCategory << " -->\n";
+
+      os << "\n<!-- BUGFILE " << DirName << MainReportEntry->getName()
+         << " -->\n";
+
+      os << "\n<!-- BUGLINE " << MainReportFileFSL.getExpansionLineNumber()
+         << " -->\n";
+
+      os << "\n<!-- BUGCOLUMN " << MainReportFileFSL.getExpansionColumnNumber()
+         << " -->\n";
+
+      os << "\n<!-- BUGPATHLENGTH " << path.size() << " -->\n";
+
+      // Mark the end of the tags.
+      os << "\n<!-- BUGMETAEND -->\n";
+
+      // Insert the text.
+      R->InsertTextBefore(SMgr.getLocForStartOfFile(FID), os.str());
+    }
+  }
+
 public:
   HTMLDiagnostics(const std::string& prefix, const Preprocessor &pp);
 
@@ -54,9 +222,10 @@ public:
   unsigned ProcessMacroPiece(raw_ostream &os,
                              const PathDiagnosticMacroPiece& P,
                              unsigned num);
-
-  void HandlePiece(Rewriter& R, FileID BugFileID,
-                   const PathDiagnosticPiece& P, unsigned num, unsigned max);
+  void
+  HandlePiece(Rewriter& R, const PathDiagnosticPiece& P, unsigned num,
+              unsigned max, const std::string &prevEventFile,
+              const std::string &nxtEventFile);
 
   void HighlightRange(Rewriter& R, FileID BugFileID, SourceRange Range,
                       const char *HighlightStart = "<span class=\"mrange\">",
@@ -93,6 +262,20 @@ void HTMLDiagnostics::FlushDiagnosticsImpl(
   }
 }
 
+std::string HTMLDiagnostics::getNxtEventFile(const PathDiagnosticPiece &P,
+                                             const PathPieces &path) {
+
+  const SourceManager &SMgr =
+      P.getLocation().asLocation().getExpansionLoc().getManager();
+  const FileID &FID =
+      P.getLocation().asLocation().getExpansionLoc().getFileID();
+
+  FileID MainReportFileFID =
+     (*path.rbegin())->getLocation().asLocation().getExpansionLoc().getFileID();
+  PrepareReportFile(FID, SMgr, MainReportFileFID == FID);
+  return getFromFileIDPathMap(FID.getHashValue());
+}
+
 void HTMLDiagnostics::ReportDiag(const PathDiagnostic& D,
                                  FilesMade *filesMade) {
     
@@ -114,178 +297,52 @@ void HTMLDiagnostics::ReportDiag(const PathDiagnostic& D,
   if (noDir)
     return;
 
-  // First flatten out the entire path to make it easier to use.
   PathPieces path = D.path.flatten(/*ShouldFlattenMacros=*/false);
 
-  // The path as already been prechecked that all parts of the path are
-  // from the same file and that it is non-empty.
-  const SourceManager &SMgr = (*path.begin())->getLocation().getManager();
-  assert(!path.empty());
-  FileID FID =
-    (*path.begin())->getLocation().asLocation().getExpansionLoc().getFileID();
-  assert(!FID.isInvalid());
-
-  // Create a new rewriter to generate HTML.
-  Rewriter R(const_cast<SourceManager&>(SMgr), PP.getLangOpts());
-
-  // Process the path.
   unsigned n = path.size();
   unsigned max = n;
 
-  for (PathPieces::const_reverse_iterator I = path.rbegin(), 
-       E = path.rend();
-        I != E; ++I, --n)
-    HandlePiece(R, FID, **I, n, max);
-
-  // Add line numbers, header, footer, etc.
-
-  // unsigned FID = R.getSourceMgr().getMainFileID();
-  html::EscapeText(R, FID);
-  html::AddLineNumbers(R, FID);
-
-  // If we have a preprocessor, relex the file and syntax highlight.
-  // We might not have a preprocessor if we come from a deserialized AST file,
-  // for example.
-
-  html::SyntaxHighlight(R, FID, PP);
-  html::HighlightMacros(R, FID, PP);
-
-  // Get the full directory name of the analyzed file.
-
-  const FileEntry* Entry = SMgr.getFileEntryForID(FID);
-
-  // This is a cludge; basically we want to append either the full
-  // working directory if we have no directory information.  This is
-  // a work in progress.
-
-  llvm::SmallString<0> DirName;
-
-  if (llvm::sys::path::is_relative(Entry->getName())) {
-    llvm::sys::fs::current_path(DirName);
-    DirName += '/';
+  std::string prevEventFile;
+  std::string nxtEventFile;
+  FileID MainReportFileFID =
+     (*path.rbegin())->getLocation().asLocation().getExpansionLoc().getFileID();
+  for (PathPieces::const_reverse_iterator I = path.rbegin(), E = path.rend();
+       I != E; ++I, --n) {
+    // We are emitting in a reverse order
+    PathPieces::const_reverse_iterator NextPieceIt = I;
+    FullSourceLoc CurrFSL = (**I).getLocation().asLocation().getExpansionLoc();
+    FileID FID = CurrFSL.getFileID();
+    Rewriter *R =
+        PrepareReportFile(FID, CurrFSL.getManager(), FID == MainReportFileFID);
+    prevEventFile = std::distance(E, ++NextPieceIt)
+                        ? getNxtEventFile(**(NextPieceIt), path)
+                        : "";
+    HandlePiece(*R, **I, n, max, prevEventFile, nxtEventFile);
+    nxtEventFile = getFromFileIDPathMap(FID.getHashValue());
   }
 
-  // Add the name of the file as an <h1> tag.
+  makeMainReportFile(path, D);
+  for (std::map<FileID, Rewriter *>::iterator it = FileIDRewriterMap.begin();
+       it != FileIDRewriterMap.end(); ++it)
+    makeHelperFile(it->first, path, D);
 
-  {
-    std::string s;
-    llvm::raw_string_ostream os(s);
-
-    os << "<!-- REPORTHEADER -->\n"
-      << "<h3>Bug Summary</h3>\n<table class=\"simpletable\">\n"
-          "<tr><td class=\"rowname\">File:</td><td>"
-      << html::EscapeText(DirName)
-      << html::EscapeText(Entry->getName())
-      << "</td></tr>\n<tr><td class=\"rowname\">Location:</td><td>"
-         "<a href=\"#EndPath\">line "
-      << (*path.rbegin())->getLocation().asLocation().getExpansionLineNumber()
-      << ", column "
-      << (*path.rbegin())->getLocation().asLocation().getExpansionColumnNumber()
-      << "</a></td></tr>\n"
-         "<tr><td class=\"rowname\">Description:</td><td>"
-      << D.getVerboseDescription() << "</td></tr>\n";
-
-    // Output any other meta data.
-
-    for (PathDiagnostic::meta_iterator I=D.meta_begin(), E=D.meta_end();
-         I!=E; ++I) {
-      os << "<tr><td></td><td>" << html::EscapeText(*I) << "</td></tr>\n";
-    }
-
-    os << "</table>\n<!-- REPORTSUMMARYEXTRA -->\n"
-          "<h3>Annotated Source Code</h3>\n";
-
-    R.InsertTextBefore(SMgr.getLocForStartOfFile(FID), os.str());
-  }
-
-  // Embed meta-data tags.
-  {
-    std::string s;
-    llvm::raw_string_ostream os(s);
-
-    StringRef BugDesc = D.getVerboseDescription();
-    if (!BugDesc.empty())
-      os << "\n<!-- BUGDESC " << BugDesc << " -->\n";
-
-    StringRef BugType = D.getBugType();
-    if (!BugType.empty())
-      os << "\n<!-- BUGTYPE " << BugType << " -->\n";
-
-    StringRef BugCategory = D.getCategory();
-    if (!BugCategory.empty())
-      os << "\n<!-- BUGCATEGORY " << BugCategory << " -->\n";
-
-    os << "\n<!-- BUGFILE " << DirName << Entry->getName() << " -->\n";
-
-    os << "\n<!-- BUGLINE "
-       << path.back()->getLocation().asLocation().getExpansionLineNumber()
-       << " -->\n";
-
-    os << "\n<!-- BUGCOLUMN "
-      << path.back()->getLocation().asLocation().getExpansionColumnNumber()
-      << " -->\n";
-
-    os << "\n<!-- BUGPATHLENGTH " << path.size() << " -->\n";
-
-    // Mark the end of the tags.
-    os << "\n<!-- BUGMETAEND -->\n";
-
-    // Insert the text.
-    R.InsertTextBefore(SMgr.getLocForStartOfFile(FID), os.str());
-  }
-
-  // Add CSS, header, and footer.
-
-  html::AddHeaderFooterInternalBuiltinCSS(R, FID, Entry->getName());
-
-  // Get the rewrite buffer.
-  const RewriteBuffer *Buf = R.getRewriteBufferFor(FID);
-
-  if (!Buf) {
-    llvm::errs() << "warning: no diagnostics generated for main file.\n";
-    return;
-  }
-
-  // Create a path for the target HTML file.
-  int FD;
-  SmallString<128> Model, ResultPath;
-  llvm::sys::path::append(Model, Directory, "report-%%%%%%.html");
-
-  if (llvm::error_code EC =
-          llvm::sys::fs::createUniqueFile(Model.str(), FD, ResultPath)) {
-    llvm::errs() << "warning: could not create file in '" << Directory
-                 << "': " << EC.message() << '\n';
-    return;
-  }
-
-  llvm::raw_fd_ostream os(FD, true);
-
-  if (filesMade)
-    filesMade->addDiagnostic(D, getName(),
-                             llvm::sys::path::filename(ResultPath));
-
-  // Emit the HTML to disk.
-  for (RewriteBuffer::iterator I = Buf->begin(), E = Buf->end(); I!=E; ++I)
-      os << *I;
+  FileIDPathMap.clear();
+  FileIDRewriterMap.clear();
 }
 
-void HTMLDiagnostics::HandlePiece(Rewriter& R, FileID BugFileID,
-                                  const PathDiagnosticPiece& P,
-                                  unsigned num, unsigned max) {
-
+void HTMLDiagnostics::HandlePiece(Rewriter& R, const PathDiagnosticPiece& P,
+                                  unsigned num, unsigned max,
+                                  const std::string &prevEventFile,
+                                  const std::string &nxtEventFile) {
   // For now, just draw a box above the line in question, and emit the
   // warning.
-  FullSourceLoc Pos = P.getLocation().asLocation();
+  FullSourceLoc Pos = P.getLocation().asLocation().getExpansionLoc();
 
   if (!Pos.isValid())
     return;
 
-  SourceManager &SM = R.getSourceMgr();
-  assert(&Pos.getManager() == &SM && "SourceManagers are different!");
+  const SourceManager &SM = R.getSourceMgr();
   std::pair<FileID, unsigned> LPosInfo = SM.getDecomposedExpansionLoc(Pos);
-
-  if (LPosInfo.first != BugFileID)
-    return;
 
   const llvm::MemoryBuffer *Buf = SM.getBuffer(LPosInfo.first);
   const char* FileStart = Buf->getBufferStart();
@@ -391,17 +448,27 @@ void HTMLDiagnostics::HandlePiece(Rewriter& R, FileID BugFileID,
     os << "<div class=\"PathIndex";
     if (Kind) os << " PathIndex" << Kind;
     os << "\">" << num << "</div>";
+    size_t fileIndex = prevEventFile.find_last_of("/");
+    std::string prevFile;
+    if (fileIndex != std::string::npos)
+      prevFile = prevEventFile.substr(fileIndex + 1);
+    else
+      prevFile = prevEventFile;
 
     if (num > 1) {
-      os << "</td><td><div class=\"PathNav\"><a href=\"#Path"
-         << (num - 1)
-         << "\" title=\"Previous event ("
-         << (num - 1)
+      os << "</td><td><div class=\"PathNav\"><a href=\"" << prevFile.c_str()
+         << "#Path" << (num - 1) << "\" title=\"Previous event (" << (num - 1)
          << ")\">&#x2190;</a></div></td>";
     }
 
     os << "</td><td>";
   }
+  size_t fileIndex = nxtEventFile.find_last_of("/");
+  std::string nxtFile;
+  if (fileIndex != std::string::npos)
+    nxtFile = nxtEventFile.substr(fileIndex + 1);
+  else
+    nxtFile = nxtEventFile;
 
   if (const PathDiagnosticMacroPiece *MP =
         dyn_cast<PathDiagnosticMacroPiece>(&P)) {
@@ -429,14 +496,13 @@ void HTMLDiagnostics::HandlePiece(Rewriter& R, FileID BugFileID,
     if (max > 1) {
       os << "</td>";
       if (num < max) {
-        os << "<td><div class=\"PathNav\"><a href=\"#";
+        os << "<td><div class=\"PathNav\"><a href=\"";
         if (num == max - 1)
-          os << "EndPath";
+          os << nxtFile.c_str() << "#EndPath";
         else
-          os << "Path" << (num + 1);
-        os << "\" title=\"Next event ("
-        << (num + 1)
-        << ")\">&#x2192;</a></div></td>";
+          os << nxtFile.c_str() << "#Path" << (num + 1);
+        os << "\" title=\"Next event (" << (num + 1)
+           << ")\">&#x2192;</a></div></td>";
       }
 
       os << "</tr></table>";
@@ -451,16 +517,14 @@ void HTMLDiagnostics::HandlePiece(Rewriter& R, FileID BugFileID,
     if (max > 1) {
       os << "</td>";
       if (num < max) {
-        os << "<td><div class=\"PathNav\"><a href=\"#";
+        os << "<td><div class=\"PathNav\"><a href=\"";
         if (num == max - 1)
-          os << "EndPath";
+          os << nxtFile.c_str() << "#EndPath";
         else
-          os << "Path" << (num + 1);
-        os << "\" title=\"Next event ("
-           << (num + 1)
+          os << nxtFile.c_str() << "#Path" << (num + 1);
+        os << "\" title=\"Next event (" << (num + 1)
            << ")\">&#x2192;</a></div></td>";
       }
-      
       os << "</tr></table>";
     }
   }

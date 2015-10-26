@@ -2242,6 +2242,10 @@ Stmt *FunctionDecl::getBody(const FunctionDecl *&Definition) const {
   return 0;
 }
 
+const FunctionDecl *FunctionDecl::getXTUDefinition(Sema *S) const {
+  return getASTContext().getXTUDefinition(this, S);
+}
+
 void FunctionDecl::setBody(Stmt *B) {
   Body = B;
   if (B)

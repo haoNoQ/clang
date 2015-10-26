@@ -191,3 +191,12 @@ static void PR16131(int x) {
   clang_analyzer_eval(*ip == 42); // expected-warning{{TRUE}}
   clang_analyzer_eval(*(int *)&v == 42); // expected-warning{{TRUE}}
 }
+
+// PR16833: Analyzer consumes memory until killed by kernel OOM killer
+// while analyzing large case ranges.
+void PR16833(unsigned op) {
+    switch (op) {
+    case 0x02 << 26 ... 0x03 << 26: // Analyzer should not hang here.
+      return;
+    }
+}

@@ -34,7 +34,7 @@ protected:
   ASTContext &Context;
   
   /// Manager of APSInt values.
-  BasicValueFactory BasicVals;
+  BasicValueFactory &BasicVals;
 
   /// Manages the creation of symbols.
   SymbolManager SymMgr;
@@ -59,11 +59,11 @@ public:
   virtual SVal dispatchCast(SVal val, QualType castTy) = 0;
 
 public:
-  SValBuilder(llvm::BumpPtrAllocator &alloc, ASTContext &context,
+  SValBuilder(BasicValueFactory &BVF, ASTContext &context,
               ProgramStateManager &stateMgr)
-    : Context(context), BasicVals(context, alloc),
-      SymMgr(context, BasicVals, alloc),
-      MemMgr(context, alloc),
+    : Context(context), BasicVals(BVF),
+      SymMgr(context, BasicVals, BVF.getAllocator()),
+      MemMgr(context, BVF.getAllocator()),
       StateMgr(stateMgr),
       ArrayIndexTy(context.IntTy),
       ArrayIndexWidth(context.getTypeSize(ArrayIndexTy)) {}
@@ -78,8 +78,9 @@ public:
     // FIXME: Remove the second disjunct when we support symbolic
     // truncation/extension.
     return (Context.getCanonicalType(Ty1) == Context.getCanonicalType(Ty2) ||
-            (Ty1->isIntegralOrEnumerationType() &&
-             Ty2->isIntegralOrEnumerationType()));
+//            (Ty1->isIntegralOrEnumerationType() &&
+//             Ty2->isIntegralOrEnumerationType()) ||
+             (Ty1->isRealFloatingType() && Ty2->isRealFloatingType()));
   }
 
   SVal evalCast(SVal val, QualType castTy, QualType originalType);
@@ -106,7 +107,8 @@ public:
 
   /// Evaluates a given SVal. If the SVal has only one possible (integer) value,
   /// that value is returned. Otherwise, returns NULL.
-  virtual const llvm::APSInt *getKnownValue(ProgramStateRef state, SVal val) = 0;
+  virtual const llvm::APSInt *getKnownIntValue(ProgramStateRef state, SVal val) = 0;
+  virtual const llvm::APFloat *getKnownFloatValue(ProgramStateRef state, SVal val) = 0;
   
   /// Constructs a symbolic expression for two non-location values.
   SVal makeSymExprValNN(ProgramStateRef state, BinaryOperator::Opcode op,
@@ -220,11 +222,11 @@ public:
   }
 
   NonLoc makeZeroArrayIndex() {
-    return nonloc::ConcreteInt(BasicVals.getValue(0, ArrayIndexTy));
+    return nonloc::ConcreteInt(BasicVals.getValue(0, ArrayIndexTy).getInt());
   }
 
   NonLoc makeArrayIndex(uint64_t idx) {
-    return nonloc::ConcreteInt(BasicVals.getValue(idx, ArrayIndexTy));
+    return nonloc::ConcreteInt(BasicVals.getValue(idx, ArrayIndexTy).getInt());
   }
 
   SVal convertToArrayIndex(SVal val);
@@ -232,7 +234,7 @@ public:
   nonloc::ConcreteInt makeIntVal(const IntegerLiteral* integer) {
     return nonloc::ConcreteInt(
         BasicVals.getValue(integer->getValue(),
-                     integer->getType()->isUnsignedIntegerOrEnumerationType()));
+                     integer->getType()->isUnsignedIntegerOrEnumerationType()).getInt());
   }
 
   nonloc::ConcreteInt makeBoolVal(const ObjCBoolLiteralExpr *boolean) {
@@ -242,22 +244,22 @@ public:
   nonloc::ConcreteInt makeBoolVal(const CXXBoolLiteralExpr *boolean);
 
   nonloc::ConcreteInt makeIntVal(const llvm::APSInt& integer) {
-    return nonloc::ConcreteInt(BasicVals.getValue(integer));
+    return nonloc::ConcreteInt(BasicVals.getValue(integer).getInt());
   }
 
   loc::ConcreteInt makeIntLocVal(const llvm::APSInt &integer) {
-    return loc::ConcreteInt(BasicVals.getValue(integer));
+    return loc::ConcreteInt(BasicVals.getValue(integer).getInt());
   }
 
   NonLoc makeIntVal(const llvm::APInt& integer, bool isUnsigned) {
-    return nonloc::ConcreteInt(BasicVals.getValue(integer, isUnsigned));
+    return nonloc::ConcreteInt(BasicVals.getValue(integer, isUnsigned).getInt());
   }
 
   DefinedSVal makeIntVal(uint64_t integer, QualType type) {
     if (Loc::isLocType(type))
-      return loc::ConcreteInt(BasicVals.getValue(integer, type));
+      return loc::ConcreteInt(BasicVals.getValue(integer, type).getInt());
 
-    return nonloc::ConcreteInt(BasicVals.getValue(integer, type));
+    return nonloc::ConcreteInt(BasicVals.getValue(integer, type).getInt());
   }
 
   NonLoc makeIntVal(uint64_t integer, bool isUnsigned) {
@@ -266,11 +268,21 @@ public:
 
   NonLoc makeIntValWithPtrWidth(uint64_t integer, bool isUnsigned) {
     return nonloc::ConcreteInt(
-        BasicVals.getIntWithPtrWidth(integer, isUnsigned));
+        BasicVals.getIntWithPtrWidth(integer, isUnsigned).getInt());
   }
 
-  NonLoc makeLocAsInteger(Loc loc, unsigned bits) {
-    return nonloc::LocAsInteger(BasicVals.getPersistentSValWithData(loc, bits));
+  nonloc::ConcreteFloat makeFloatVal(const FloatingLiteral* floating) {
+    return nonloc::ConcreteFloat(
+        BasicVals.getValue(floating->getValue()).getFloat());
+  }
+
+  nonloc::ConcreteFloat makeFloatVal(const llvm::APFloat& floating) {
+    return nonloc::ConcreteFloat(BasicVals.getValue(floating).getFloat());
+  }
+
+  NonLoc makeLocAsInteger(Loc loc, unsigned bits, unsigned isSigned) {
+    return nonloc::LocAsInteger(
+        BasicVals.getPersistentSValWithData(loc, 2 * bits + isSigned));
   }
 
   NonLoc makeNonLoc(const SymExpr *lhs, BinaryOperator::Opcode op,
@@ -280,21 +292,27 @@ public:
                     const SymExpr *lhs, QualType type);
 
   NonLoc makeNonLoc(const SymExpr *lhs, BinaryOperator::Opcode op,
+                    const llvm::APFloat& rhs, QualType type);
+
+  NonLoc makeNonLoc(const llvm::APFloat& rhs, BinaryOperator::Opcode op,
+                    const SymExpr *lhs, QualType type);
+
+  NonLoc makeNonLoc(const SymExpr *lhs, BinaryOperator::Opcode op,
                     const SymExpr *rhs, QualType type);
 
   /// \brief Create a NonLoc value for cast.
   NonLoc makeNonLoc(const SymExpr *operand, QualType fromTy, QualType toTy);
 
   nonloc::ConcreteInt makeTruthVal(bool b, QualType type) {
-    return nonloc::ConcreteInt(BasicVals.getTruthValue(b, type));
+    return nonloc::ConcreteInt(BasicVals.getTruthValue(b, type).getInt());
   }
 
   nonloc::ConcreteInt makeTruthVal(bool b) {
-    return nonloc::ConcreteInt(BasicVals.getTruthValue(b));
+    return nonloc::ConcreteInt(BasicVals.getTruthValue(b).getInt());
   }
 
   Loc makeNull() {
-    return loc::ConcreteInt(BasicVals.getZeroWithPtrWidth());
+    return loc::ConcreteInt(BasicVals.getZeroWithPtrWidth().getInt());
   }
 
   Loc makeLoc(SymbolRef sym) {
@@ -310,7 +328,7 @@ public:
   }
 
   Loc makeLoc(const llvm::APSInt& integer) {
-    return loc::ConcreteInt(BasicVals.getValue(integer));
+    return loc::ConcreteInt(BasicVals.getValue(integer).getInt());
   }
 
   /// Return a memory region for the 'this' object reference.
@@ -322,7 +340,7 @@ public:
                                const StackFrameContext *SFC);
 };
 
-SValBuilder* createSimpleSValBuilder(llvm::BumpPtrAllocator &alloc,
+SValBuilder* createSimpleSValBuilder(BasicValueFactory &BVF,
                                      ASTContext &context,
                                      ProgramStateManager &stateMgr);
 

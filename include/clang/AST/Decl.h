@@ -38,6 +38,7 @@ class LabelStmt;
 class MemberSpecializationInfo;
 class Module;
 class NestedNameSpecifier;
+class Sema;
 class Stmt;
 class StringLiteral;
 class TemplateArgumentList;
@@ -460,6 +461,7 @@ public:
 
   friend class ASTDeclReader;
   friend class ASTDeclWriter;
+  friend class ASTNodeImporter;
 };
 
 /// ValueDecl - Represent the declaration of a variable (in which case it is
@@ -1653,6 +1655,8 @@ public:
     return getBody(Definition);
   }
 
+  const FunctionDecl *getXTUDefinition(Sema *S = NULL) const;
+
   /// isThisDeclarationADefinition - Returns whether this specific
   /// declaration of the function is also a definition. This does not
   /// determine whether the function has been defined (e.g., in a
@@ -2117,6 +2121,7 @@ public:
 
   friend class ASTDeclReader;
   friend class ASTDeclWriter;
+  friend class ASTNodeImporter;
 };
 
 

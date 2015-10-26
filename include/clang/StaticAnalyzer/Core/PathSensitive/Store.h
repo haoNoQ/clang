@@ -31,9 +31,11 @@ class StackFrameContext;
 namespace ento {
 
 class CallEvent;
+class FunctionCallBranchSummary;
 class ProgramState;
 class ProgramStateManager;
 class ScanReachableSymbols;
+class Summarizer;
 
 typedef llvm::DenseSet<SymbolRef> InvalidatedSymbols;
 
@@ -68,6 +70,8 @@ public:
   ///   bindings as \c state with the addition of having the value specified
   ///   by \c val bound to the location given for \c loc.
   virtual StoreRef Bind(Store store, Loc loc, SVal val) = 0;
+  virtual StoreRef BindByOffset(Store store, Loc loc, SVal val,
+                                uint64_t Offset, bool Direct=true) = 0;
 
   virtual StoreRef BindDefault(Store store, const MemRegion *R, SVal V);
 
@@ -141,11 +145,14 @@ public:
   ///  casted and 'CastToTy' the result type of the cast.
   const MemRegion *castRegion(const MemRegion *region, QualType CastToTy);
 
-  virtual StoreRef removeDeadBindings(Store store, const StackFrameContext *LCtx,
+  virtual StoreRef removeDeadBindings(Store store,
+                                      const StackFrameContext *LCtx,
                                       SymbolReaper& SymReaper) = 0;
 
   virtual bool includedInBindings(Store store,
                                   const MemRegion *region) const = 0;
+
+  virtual bool hasDirectBinding(Store store, const MemRegion *R) const = 0;
   
   /// If the StoreManager supports it, increment the reference count of
   /// the specified Store object.
@@ -191,6 +198,12 @@ public:
                                   InvalidatedRegions *InvalidatedTopLevel,
                                   InvalidatedRegions *Invalidated) = 0;
 
+//  virtual void populateCallSummary(FunctionCallBranchSummary &Summary,
+//                                   ProgramStateRef state) = 0;
+
+//  virtual ProgramStateRef applyCallSummary(const FunctionCallBranchSummary &Summary,
+//                                           ProgramStateRef state) = 0;
+
   /// enterStackFrame - Let the StoreManager to do something when execution
   /// engine is about to execute into a callee.
   StoreRef enterStackFrame(Store store,
@@ -209,8 +222,9 @@ public:
   class BindingsHandler {
   public:
     virtual ~BindingsHandler();
-    virtual bool HandleBinding(StoreManager& SMgr, Store store,
-                               const MemRegion *region, SVal val) = 0;
+    virtual bool HandleBinding(StoreManager &SMgr, Store store,
+                               const MemRegion *region, uint64_t Offset,
+                               SVal val, bool Direct) = 0;
   };
 
   class FindUniqueBinding :
@@ -222,8 +236,8 @@ public:
   public:
     FindUniqueBinding(SymbolRef sym) : Sym(sym), Binding(0), First(true) {}
 
-    bool HandleBinding(StoreManager& SMgr, Store store, const MemRegion* R,
-                       SVal val);
+    bool HandleBinding(StoreManager &SMgr, Store store, const MemRegion *R,
+                       uint64_t Offset, SVal val, bool Direct);
     LLVM_EXPLICIT operator bool() { return First && Binding; }
     const MemRegion *getRegion() { return Binding; }
   };

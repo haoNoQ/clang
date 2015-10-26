@@ -49,7 +49,7 @@ CompilerInvocationBase::CompilerInvocationBase()
 
 CompilerInvocationBase::CompilerInvocationBase(const CompilerInvocationBase &X)
   : RefCountedBase<CompilerInvocation>(),
-    LangOpts(new LangOptions(*X.getLangOpts())), 
+    LangOpts(new LangOptions(*X.getLangOpts())),
     TargetOpts(new TargetOptions(X.getTargetOpts())),
     DiagnosticOpts(new DiagnosticOptions(X.getDiagnosticOpts())),
     HeaderSearchOpts(new HeaderSearchOptions(X.getHeaderSearchOpts())),
@@ -249,7 +249,21 @@ static bool ParseAnalyzerArgs(AnalyzerOptions &Opts, ArgList &Args,
     for (unsigned i = 0, e = checkers.size(); i != e; ++i)
       Opts.CheckersControlList.push_back(std::make_pair(checkers[i], enable));
   }
-  
+
+  for (arg_iterator it = Args.filtered_begin(OPT_analyzer_checker_option),
+         ie = Args.filtered_end(); it != ie; ++it) {
+    const Arg *A = *it;
+    A->claim();
+    // We can have a list of comma separated checker names, e.g:
+    // '-analyzer-checker=cocoa,unix'
+    StringRef optionList = A->getValue();
+    SmallVector<StringRef, 3> options;
+    optionList.split(options, ":");
+    llvm::StringMap<StringRef> &CheckerOpts =
+        Opts.CheckerSpecificOptions[options[0]];
+    CheckerOpts[options[1]] = options[2];
+  }
+
   // Go through the analyzer configuration options.
   for (arg_iterator it = Args.filtered_begin(OPT_analyzer_config),
        ie = Args.filtered_end(); it != ie; ++it) {
@@ -606,7 +620,7 @@ bool clang::ParseDiagnosticArgs(DiagnosticOptions &Opts, ArgList &Args,
       << Args.getLastArg(OPT_fdiagnostics_format)->getAsString(Args)
       << Format;
   }
-  
+
   Opts.ShowSourceRanges = Args.hasArg(OPT_fdiagnostics_print_source_range_info);
   Opts.ShowParseableFixits = Args.hasArg(OPT_fdiagnostics_parseable_fixits);
   Opts.ShowPresumedLoc = !Args.hasArg(OPT_fno_diagnostics_use_presumed_location);
@@ -761,7 +775,7 @@ static InputKind ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
   Opts.ASTDumpLookups = Args.hasArg(OPT_ast_dump_lookups);
   Opts.UseGlobalModuleIndex = !Args.hasArg(OPT_fno_modules_global_index);
   Opts.GenerateGlobalModuleIndex = Opts.UseGlobalModuleIndex;
-  
+
   Opts.CodeCompleteOpts.IncludeMacros
     = Args.hasArg(OPT_code_completion_macros);
   Opts.CodeCompleteOpts.IncludeCodePatterns
@@ -925,7 +939,7 @@ static void ParseHeaderSearchArgs(HeaderSearchOptions &Opts, ArgList &Args) {
 
   // Add -I..., -F..., and -index-header-map options in order.
   bool IsIndexHeaderMap = false;
-  for (arg_iterator it = Args.filtered_begin(OPT_I, OPT_F, 
+  for (arg_iterator it = Args.filtered_begin(OPT_I, OPT_F,
                                              OPT_index_header_map),
        ie = Args.filtered_end(); it != ie; ++it) {
     if ((*it)->getOption().matches(OPT_index_header_map)) {
@@ -933,10 +947,10 @@ static void ParseHeaderSearchArgs(HeaderSearchOptions &Opts, ArgList &Args) {
       IsIndexHeaderMap = true;
       continue;
     }
-        
-    frontend::IncludeDirGroup Group 
+
+    frontend::IncludeDirGroup Group
       = IsIndexHeaderMap? frontend::IndexHeaderMap : frontend::Angled;
-    
+
     Opts.AddPath((*it)->getValue(), Group,
                  /*IsFramework=*/ (*it)->getOption().matches(OPT_F), true);
     IsIndexHeaderMap = false;
@@ -1075,7 +1089,7 @@ void CompilerInvocation::setLangDefaults(LangOptions &Opts, InputKind IK,
     Opts.OpenCL = 1;
     Opts.OpenCLVersion = 120;
   }
-  
+
   // OpenCL has some additional defaults.
   if (Opts.OpenCL) {
     Opts.AltiVec = 0;
@@ -1139,7 +1153,7 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
       Diags.Report(diag::err_drv_invalid_value)
         << A->getAsString(Args) << A->getValue();
     else {
-      // Valid standard, check to make sure language and standard are compatable.    
+      // Valid standard, check to make sure language and standard are compatable.
       const LangStandard &Std = LangStandard::getLangStandardForKind(LangStd);
       switch (IK) {
       case IK_C:
@@ -1183,7 +1197,7 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
     .Case("CL1.1", LangStandard::lang_opencl11)
     .Case("CL1.2", LangStandard::lang_opencl12)
     .Default(LangStandard::lang_unspecified);
-    
+
     if (OpenCLLangStd == LangStandard::lang_unspecified) {
       Diags.Report(diag::err_drv_invalid_value)
       << A->getAsString(Args) << A->getValue();
@@ -1191,7 +1205,7 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
     else
       LangStd = OpenCLLangStd;
   }
-  
+
   CompilerInvocation::setLangDefaults(Opts, IK, LangStd);
 
   // We abuse '-f[no-]gnu-keywords' to force overriding all GNU-extension
@@ -1235,7 +1249,7 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
       Opts.ObjCSubscriptingLegacyRuntime =
         (Opts.ObjCRuntime.getKind() == ObjCRuntime::FragileMacOSX);
   }
-    
+
   if (Args.hasArg(OPT_fgnu89_inline))
     Opts.GNUInline = 1;
 
@@ -1352,7 +1366,7 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
   Opts.PIELevel = getLastArgIntValue(Args, OPT_pie_level, 0, Diags);
   Opts.Static = Args.hasArg(OPT_static_define);
   Opts.DumpRecordLayoutsSimple = Args.hasArg(OPT_fdump_record_layouts_simple);
-  Opts.DumpRecordLayouts = Opts.DumpRecordLayoutsSimple 
+  Opts.DumpRecordLayouts = Opts.DumpRecordLayoutsSimple
                         || Args.hasArg(OPT_fdump_record_layouts);
   Opts.DumpVTableLayouts = Args.hasArg(OPT_fdump_vtable_layouts);
   Opts.SpellChecking = !Args.hasArg(OPT_fno_spell_checking);
@@ -1376,7 +1390,7 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
       .Case("yes", LangOptions::ASMM_On)
       .Default(255)) {
     default:
-      Diags.Report(diag::err_drv_invalid_value) 
+      Diags.Report(diag::err_drv_invalid_value)
         << "-faddress-space-map-mangling=" << A->getValue();
       break;
     case LangOptions::ASMM_Target:
@@ -1537,7 +1551,7 @@ static void ParsePreprocessorArgs(PreprocessorOptions &Opts, ArgList &Args,
 
     Opts.addRemappedFile(Split.first, Split.second);
   }
-  
+
   if (Arg *A = Args.getLastArg(OPT_fobjc_arc_cxxlib_EQ)) {
     StringRef Name = A->getValue();
     unsigned Library = llvm::StringSwitch<unsigned>(Name)
@@ -1666,7 +1680,7 @@ bool CompilerInvocation::CreateFromArgs(CompilerInvocation &Res,
   }
   // FIXME: ParsePreprocessorArgs uses the FileManager to read the contents of
   // PCH file and find the original header name. Remove the need to do that in
-  // ParsePreprocessorArgs and remove the FileManager 
+  // ParsePreprocessorArgs and remove the FileManager
   // parameters from the function and the "FileManager.h" #include.
   FileManager FileMgr(Res.getFileSystemOpts());
   ParsePreprocessorArgs(Res.getPreprocessorOpts(), *Args, FileMgr, Diags);
@@ -1683,14 +1697,14 @@ namespace {
     SmallVector<uint64_t, 16> Data;
     unsigned CurBit;
     uint64_t CurValue;
-    
+
   public:
     ModuleSignature() : CurBit(0), CurValue(0) { }
-    
+
     void add(uint64_t Value, unsigned Bits);
     void add(StringRef Value);
     void flush();
-    
+
     llvm::APInt getAsInteger() const;
   };
 }
@@ -1701,10 +1715,10 @@ void ModuleSignature::add(uint64_t Value, unsigned int NumBits) {
     CurBit += NumBits;
     return;
   }
-  
+
   // Add the current word.
   Data.push_back(CurValue);
-  
+
   if (CurBit)
     CurValue = Value >> (64-CurBit);
   else
@@ -1715,7 +1729,7 @@ void ModuleSignature::add(uint64_t Value, unsigned int NumBits) {
 void ModuleSignature::flush() {
   if (CurBit == 0)
     return;
-  
+
   Data.push_back(CurValue);
   CurBit = 0;
   CurValue = 0;
@@ -1750,7 +1764,7 @@ std::string CompilerInvocation::getModuleHash() const {
 #define BENIGN_LANGOPT(Name, Bits, Default, Description)
 #define BENIGN_ENUM_LANGOPT(Name, Type, Bits, Default, Description)
 #include "clang/Basic/LangOptions.def"
-  
+
   // Extend the signature with the target options.
   code = hash_combine(code, TargetOpts->Triple, TargetOpts->CPU,
                       TargetOpts->ABI, TargetOpts->CXXABI,
@@ -1764,7 +1778,7 @@ std::string CompilerInvocation::getModuleHash() const {
   code = hash_combine(code, ppOpts.UsePredefines, ppOpts.DetailedRecord);
 
   std::vector<StringRef> MacroDefs;
-  for (std::vector<std::pair<std::string, bool/*isUndef*/> >::const_iterator 
+  for (std::vector<std::pair<std::string, bool/*isUndef*/> >::const_iterator
             I = getPreprocessorOpts().Macros.begin(),
          IEnd = getPreprocessorOpts().Macros.end();
        I != IEnd; ++I) {

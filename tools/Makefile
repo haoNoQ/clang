@@ -20,6 +20,8 @@ endif
 
 ifeq ($(ENABLE_CLANG_STATIC_ANALYZER), 1)
   PARALLEL_DIRS += clang-check
+  PARALLEL_DIRS += clang-func-mapping
+  PARALLEL_DIRS += clang-cmdline-arch-extractor
 endif
 
 ifeq ($(ENABLE_CLANG_ARCMT), 1)

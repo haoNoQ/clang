@@ -1877,8 +1877,7 @@ PathDiagnosticPiece *CFRefReportVisitor::VisitNode(const ExplodedNode *N,
   // program point
   SmallVector<ArgEffect, 2> AEffects;
 
-  const ExplodedNode *OrigNode = BRC.getNodeResolver().getOriginalNode(N);
-  if (const RetainSummary *Summ = SummaryLog.lookup(OrigNode)) {
+  if (const RetainSummary *Summ = SummaryLog.lookup(N)) {
     // We only have summaries attached to nodes after evaluating CallExpr and
     // ObjCMessageExprs.
     const Stmt *S = N->getLocation().castAs<StmtPoint>().getStmt();

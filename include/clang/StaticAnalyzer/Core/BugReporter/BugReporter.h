@@ -26,7 +26,7 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
-
+#include <set>
 namespace clang {
 
 class ASTContext;
@@ -52,7 +52,7 @@ class BugType;
 /// This class provides an interface through which checkers can create
 /// individual bug reports.
 class BugReport : public llvm::ilist_node<BugReport> {
-public:  
+public:
   class NodeResolver {
     virtual void anchor();
   public:
@@ -65,7 +65,9 @@ public:
   typedef SmallVector<BugReporterVisitor *, 8> VisitorList;
   typedef VisitorList::iterator visitor_iterator;
   typedef SmallVector<StringRef, 2> ExtraTextList;
-
+  typedef SmallVector<PathDiagnosticLocation, 4> PathLocations;
+  typedef SmallVector<const ExplodedNode *, 16> NodeVector;
+  typedef llvm::DenseMap<const void *, const void *> IntermediateSummaryInfoTy;
 protected:
   friend class BugReporter;
   friend class BugReportEquivClass;
@@ -75,13 +77,17 @@ protected:
   std::string ShortDescription;
   std::string Description;
   PathDiagnosticLocation Location;
+  PathLocations Locations;
   PathDiagnosticLocation UniqueingLocation;
   const Decl *UniqueingDecl;
-  
-  const ExplodedNode *ErrorNode;
+
+  NodeVector SummaryNodes;
+  IntermediateSummaryInfoTy IntermediateSummaryInfo;
+
   SmallVector<SourceRange, 4> Ranges;
   ExtraTextList ExtraText;
-  
+  SmallVector<PathDiagnosticPiece*, 4> ExtraPieces;
+
   typedef llvm::DenseSet<SymbolRef> Symbols;
   typedef llvm::DenseSet<const MemRegion *> Regions;
 
@@ -142,20 +148,29 @@ private:
   void popInterestingSymbolsAndRegions();
 
 public:
-  BugReport(BugType& bt, StringRef desc, const ExplodedNode *errornode)
-    : BT(bt), DeclWithIssue(0), Description(desc), ErrorNode(errornode),
-      ConfigurationChangeToken(0), DoNotPrunePath(false) {}
+  BugReport(BugType &bt, StringRef desc, const ExplodedNode *errornode)
+      : BT(bt), DeclWithIssue(0), Description(desc),
+        ConfigurationChangeToken(0), DoNotPrunePath(false) {
+    appendSummaryNode(errornode);
+  }
 
-  BugReport(BugType& bt, StringRef shortDesc, StringRef desc,
+  BugReport(BugType &bt, StringRef shortDesc, StringRef desc,
             const ExplodedNode *errornode)
-    : BT(bt), DeclWithIssue(0), ShortDescription(shortDesc), Description(desc),
-      ErrorNode(errornode), ConfigurationChangeToken(0),
-      DoNotPrunePath(false) {}
+      : BT(bt), DeclWithIssue(0), ShortDescription(shortDesc),
+        Description(desc), ConfigurationChangeToken(0),
+        DoNotPrunePath(false) {
+    appendSummaryNode(errornode);
+  }
 
-  BugReport(BugType& bt, StringRef desc, PathDiagnosticLocation l)
-    : BT(bt), DeclWithIssue(0), Description(desc), Location(l), ErrorNode(0),
-      ConfigurationChangeToken(0),
-      DoNotPrunePath(false) {}
+  BugReport(BugType &bt, StringRef desc, PathDiagnosticLocation l)
+      : BT(bt), DeclWithIssue(0), Description(desc), Location(l),
+        ConfigurationChangeToken(0), DoNotPrunePath(false) {}
+
+  BugReport(BugType &bt, StringRef desc, PathLocations pl)
+      : BT(bt), DeclWithIssue(0), Description(desc), Locations(pl),
+        ConfigurationChangeToken(0), DoNotPrunePath(false) {
+    Location = *(Locations.rbegin());
+  }
 
   /// \brief Create a BugReport with a custom uniqueing location.
   ///
@@ -164,20 +179,22 @@ public:
   /// to the user. This method allows to rest the location which should be used
   /// for uniquing reports. For example, memory leaks checker, could set this to
   /// the allocation site, rather then the location where the bug is reported.
-  BugReport(BugType& bt, StringRef desc, const ExplodedNode *errornode,
+  BugReport(BugType &bt, StringRef desc, const ExplodedNode *errornode,
             PathDiagnosticLocation LocationToUnique, const Decl *DeclToUnique)
-    : BT(bt), DeclWithIssue(0), Description(desc),
-      UniqueingLocation(LocationToUnique),
-      UniqueingDecl(DeclToUnique),
-      ErrorNode(errornode), ConfigurationChangeToken(0),
-      DoNotPrunePath(false) {}
+      : BT(bt), DeclWithIssue(0), Description(desc),
+        UniqueingLocation(LocationToUnique), UniqueingDecl(DeclToUnique),
+        ConfigurationChangeToken(0), DoNotPrunePath(false) {
+    appendSummaryNode(errornode);
+  }
 
   virtual ~BugReport();
 
   const BugType& getBugType() const { return BT; }
   BugType& getBugType() { return BT; }
 
-  const ExplodedNode *getErrorNode() const { return ErrorNode; }
+  const ExplodedNode *getErrorNode() const {
+    return SummaryNodes.empty() ? 0 : SummaryNodes.back();
+  }
 
   const StringRef getDescription() const { return Description; }
 
@@ -185,6 +202,12 @@ public:
     if (ShortDescription.empty() && UseFallback)
       return Description;
     return ShortDescription;
+  }
+
+  const NodeVector &getSummaryNodes() const { return SummaryNodes; }
+
+  const IntermediateSummaryInfoTy &getIntermediateSummaryInfo() const {
+    return IntermediateSummaryInfo;
   }
 
   /// Indicates whether or not any path pruning should take place
@@ -206,6 +229,14 @@ public:
 
   unsigned getConfigurationChangeToken() const {
     return ConfigurationChangeToken;
+  }
+
+  void appendSummaryNode(const ExplodedNode *N) {
+    SummaryNodes.push_back(N);
+  }
+
+  void appendIntermediateSummaryInfo(const void *Tag, const void *Value) {
+    IntermediateSummaryInfo[Tag] = Value;
   }
 
   /// Returns whether or not this report should be considered valid.
@@ -246,6 +277,13 @@ public:
     DeclWithIssue = declWithIssue;
   }
   
+  void addExtraPieces(PathDiagnosticPiece *P) {
+    ExtraPieces.push_back(P);
+  }
+  SmallVector<PathDiagnosticPiece*, 4> getExtraPieces() {
+     return ExtraPieces;
+   }
+
   /// \brief This allows for addition of meta data to the diagnostic.
   ///
   /// Currently, only the HTMLDiagnosticClient knows how to display it. 
@@ -264,6 +302,7 @@ public:
   ///  This location is used by clients rendering diagnostics.
   virtual PathDiagnosticLocation getLocation(const SourceManager &SM) const;
 
+  PathLocations getLocations() const;
   /// \brief Get the location on which the report should be uniqued.
   PathDiagnosticLocation getUniqueingLocation() const {
     return UniqueingLocation;
@@ -426,6 +465,8 @@ public:
     return D.getDiagnostic();
   }
 
+
+
   ArrayRef<PathDiagnosticConsumer*> getPathDiagnosticConsumers() {
     return D.getPathDiagnosticConsumers();
   }
@@ -542,8 +583,6 @@ public:
   SourceManager& getSourceManager() {
     return BR.getSourceManager();
   }
-
-  virtual BugReport::NodeResolver& getNodeResolver() = 0;
 };
 
 } // end GR namespace

@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/StaticAnalyzer/Core/PathSensitive/AnalysisManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "clang/Analysis/CFG.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
@@ -42,6 +43,8 @@ void ProgramStateRelease(const ProgramState *state) {
 }
 }}
 
+std::vector<ProgramState *> ProgramStateManager::freeStates;
+
 ProgramState::ProgramState(ProgramStateManager *mgr, const Environment& env,
                  StoreRef st, GenericDataMap gdm)
   : stateMgr(mgr),
@@ -70,17 +73,20 @@ ProgramState::~ProgramState() {
 ProgramStateManager::ProgramStateManager(ASTContext &Ctx,
                                          StoreManagerCreator CreateSMgr,
                                          ConstraintManagerCreator CreateCMgr,
-                                         llvm::BumpPtrAllocator &alloc,
+                                         BasicValueFactory &BVF,
                                          SubEngine *SubEng)
-  : Eng(SubEng), EnvMgr(alloc), GDMFactory(alloc),
-    svalBuilder(createSimpleSValBuilder(alloc, Ctx, *this)),
-    CallEventMgr(new CallEventManager(alloc)), Alloc(alloc) {
+  : Alloc(BVF.getAllocator()), Eng(SubEng), EnvMgr(Alloc), GDMFactory(Alloc),
+    svalBuilder(createSimpleSValBuilder(BVF, Ctx, *this)),
+    CallEventMgr(new CallEventManager(Alloc))  {
   StoreMgr.reset((*CreateSMgr)(*this));
   ConstraintMgr.reset((*CreateCMgr)(*this, SubEng));
 }
 
 
 ProgramStateManager::~ProgramStateManager() {
+  if (Eng->getAnalysisManager().getAnalyzerOptions().getIPAMode() !=
+      IPAK_Summary)
+    freeStates.clear();
   for (GDMContextsTy::iterator I=GDMContexts.begin(), E=GDMContexts.end();
        I!=E; ++I)
     I->second.second(I->second.first);
@@ -102,13 +108,18 @@ ProgramStateManager::removeDeadBindings(ProgramStateRef state,
   NewState.Env = EnvMgr.removeDeadBindings(NewState.Env, SymReaper, state);
 
   // Clean up the store.
-  StoreRef newStore = StoreMgr->removeDeadBindings(NewState.getStore(), LCtx,
-                                                   SymReaper);
+  StoreRef newStore =
+      StoreMgr->removeDeadBindings(NewState.getStore(), LCtx, SymReaper);
   NewState.setStore(newStore);
   SymReaper.setReapedStore(newStore);
 
   ProgramStateRef Result = getPersistentState(NewState);
   return ConstraintMgr->removeDeadBindings(Result, SymReaper);
+}
+
+void ProgramStateManager::printStats() const {
+  llvm::errs() << "Free states: " << freeStates.size() << "\n" <<
+                  "States in set: " << StateSet.size() << "\n";
 }
 
 ProgramStateRef ProgramState::bindLoc(Loc LV, SVal V, bool notifyChanges) const {
@@ -120,6 +131,41 @@ ProgramStateRef ProgramState::bindLoc(Loc LV, SVal V, bool notifyChanges) const 
     return Mgr.getOwningEngine()->processRegionChange(newState, MR);
 
   return newState;
+}
+
+ProgramStateRef ProgramState::bindLocByOffset(Loc LV, SVal V, uint64_t Offset,
+                                              bool isDirect,
+                                              bool notifyChanges) const {
+  ProgramStateManager &Mgr = getStateManager();
+  ProgramStateRef newState = makeWithStore(
+      Mgr.StoreMgr->BindByOffset(getStore(), LV, V, Offset, isDirect));
+  const MemRegion *MR = LV.getAsRegion();
+  if (MR && Mgr.getOwningEngine() && notifyChanges)
+    return Mgr.getOwningEngine()->processRegionChange(newState, MR);
+
+  return newState;
+}
+
+ProgramStateRef ProgramState::bindLocsByOffset(ArrayRef<OffsetBind> Binds,
+                                               bool notifyChanges) const {
+  ProgramStateManager &Mgr = getStateManager();
+  StoreRef store(getStore(), Mgr.getStoreManager());
+  size_t e = Binds.size();
+  for (size_t i = 0; i < e; i++) {
+    const OffsetBind &B = Binds[i];
+    store = Mgr.StoreMgr->BindByOffset(store.getStore(), B.Dest, B.Value,
+                                       B.Offset, B.IsDirect);
+  }
+
+  ProgramStateRef ResSt = makeWithStore(store);
+  if (notifyChanges && Mgr.getOwningEngine())
+    for (size_t i = 0; i < e; i++) {
+      const MemRegion *MR = Binds[i].Dest.getAsRegion();
+      if (MR)
+        ResSt = Mgr.getOwningEngine()->processRegionChange(ResSt, MR);
+    }
+
+  return ResSt;
 }
 
 ProgramStateRef ProgramState::bindDefault(SVal loc, SVal V) const {
@@ -242,7 +288,7 @@ SVal ProgramState::getSValAsScalarOrLoc(const MemRegion *R) const {
 
   if (const TypedValueRegion *TR = dyn_cast<TypedValueRegion>(R)) {
     QualType T = TR->getValueType();
-    if (Loc::isLocType(T) || T->isIntegralOrEnumerationType())
+    if (Loc::isLocType(T) || T->isIntegralOrEnumerationType() || T->isRealFloatingType())
       return getSVal(R);
   }
 
@@ -258,9 +304,9 @@ SVal ProgramState::getSVal(Loc location, QualType T) const {
   // about).
   if (!T.isNull()) {
     if (SymbolRef sym = V.getAsSymbol()) {
-      if (const llvm::APSInt *Int = getStateManager()
-                                    .getConstraintManager()
-                                    .getSymVal(this, sym)) {
+      const APValue *Val =
+        getStateManager().getConstraintManager().getSymVal(this, sym);
+      if (Val && Val->isInt()) {
         // FIXME: Because we don't correctly model (yet) sign-extension
         // and truncation of symbolic values, we need to convert
         // the integer value to the correct signedness and bitwidth.
@@ -275,12 +321,23 @@ SVal ProgramState::getSVal(Loc location, QualType T) const {
         //  The symbolic value stored to 'x' is actually the conjured
         //  symbol for the call to foo(); the type of that symbol is 'char',
         //  not unsigned.
-        const llvm::APSInt &NewV = getBasicVals().Convert(T, *Int);
+        const APValue &NewV = getBasicVals().Convert(T, Val->getInt());
+        if (T->isFloatingType()) {
+          const llvm::APFloat NewFloat = NewV.getFloat();
+          assert(V.getAs<NonLoc>() && "Locs cannot have floating-point values!");
+          return getStateManager().getSValBuilder().makeFloatVal(NewFloat);
+        }
+        const llvm::APSInt &NewInt = NewV.getInt();
         
         if (V.getAs<Loc>())
-          return loc::ConcreteInt(NewV);
+          return loc::ConcreteInt(NewInt);
         else
-          return nonloc::ConcreteInt(NewV);
+          return nonloc::ConcreteInt(NewInt);
+      }
+      if (Val && Val->isFloat()) {
+        const llvm::APFloat &NewV = getBasicVals().getValue(Val->getFloat()).getFloat();
+        assert(V.getAs<NonLoc>() && "Locs cannot have floating-point values!");
+        return nonloc::ConcreteFloat(NewV);
       }
     }
   }
@@ -293,7 +350,7 @@ ProgramStateRef ProgramState::BindExpr(const Stmt *S,
                                            SVal V, bool Invalidate) const{
   Environment NewEnv =
     getStateManager().EnvMgr.bindExpr(Env, EnvironmentEntry(S, LCtx), V,
-                                      Invalidate);
+                                      Invalidate, getSymbolManager());
   if (NewEnv == Env)
     return this;
 
@@ -321,7 +378,7 @@ ProgramStateRef ProgramState::assumeInBound(DefinedOrUnknownSVal Idx,
   // FIXME: This should be using ValueManager::ArrayindexTy...somehow.
   if (indexTy.isNull())
     indexTy = Ctx.IntTy;
-  nonloc::ConcreteInt Min(BVF.getMinValue(indexTy));
+  nonloc::ConcreteInt Min(BVF.getMinValue(indexTy).getInt());
 
   // Adjust the index.
   SVal newIdx = svalBuilder.evalBinOpNN(this, BO_Add,
@@ -542,6 +599,8 @@ bool ScanReachableSymbols::scan(const SymExpr *sym) {
     case SymExpr::DerivedKind:
     case SymExpr::ExtentKind:
     case SymExpr::MetadataKind:
+    case SymExpr::RegionAddressKind:
+    case SymExpr::LabelAddressKind:
       break;
     case SymExpr::CastSymbolKind:
       return scan(cast<SymbolCast>(sym)->getOperand());
@@ -549,6 +608,10 @@ bool ScanReachableSymbols::scan(const SymExpr *sym) {
       return scan(cast<SymIntExpr>(sym)->getLHS());
     case SymExpr::IntSymKind:
       return scan(cast<IntSymExpr>(sym)->getRHS());
+    case SymExpr::SymFloatKind:
+          return scan(cast<SymFloatExpr>(sym)->getLHS());
+        case SymExpr::FloatSymKind:
+          return scan(cast<FloatSymExpr>(sym)->getRHS());
     case SymExpr::SymSymKind: {
       const SymSymExpr *x = cast<SymSymExpr>(sym);
       return scan(x->getLHS()) && scan(x->getRHS());

@@ -675,6 +675,14 @@ PathDiagnosticLocation
     return getLocationForCaller(CEE->getCalleeContext(),
                                 CEE->getLocationContext(),
                                 SMng);
+  } else if (Optional<CallSummaryPreApply> CA =
+                 P.getAs<CallSummaryPreApply>()) {
+    return PathDiagnosticLocation(CA->getCallExpr(), SMng,
+                                  CA->getLocationContext());
+  } else if (Optional<CallSummaryPostApply> CA =
+                 P.getAs<CallSummaryPostApply>()) {
+    return PathDiagnosticLocation(CA->getCallExpr(), SMng,
+                                  CA->getLocationContext());
   } else {
     llvm_unreachable("Unexpected ProgramPoint");
   }
@@ -689,6 +697,10 @@ const Stmt *PathDiagnosticLocation::getStmt(const ExplodedNode *N) {
   if (Optional<BlockEdge> BE = P.getAs<BlockEdge>())
     return BE->getSrc()->getTerminator();
   if (Optional<CallEnter> CE = P.getAs<CallEnter>())
+    return CE->getCallExpr();
+  if (Optional<CallSummaryPreApply> CE = P.getAs<CallSummaryPreApply>())
+    return CE->getCallExpr();
+  if (Optional<CallSummaryPostApply> CE = P.getAs<CallSummaryPostApply>())
     return CE->getCallExpr();
   if (Optional<CallExitEnd> CEE = P.getAs<CallExitEnd>())
     return CEE->getCalleeContext()->getCallSite();
@@ -753,6 +765,10 @@ PathDiagnosticLocation
       return PathDiagnosticLocation(S, SM, LC);
     return PathDiagnosticLocation(getValidSourceLocation(S, LC), SM);
   }
+
+  if (Optional<ImplicitCallPoint> ICP =
+          N->getLocation().getAs<ImplicitCallPoint>())
+    return PathDiagnosticLocation(ICP->getLocation(), SM, SingleLocK);
 
   return createDeclEnd(N->getLocationContext(), SM);
 }
@@ -869,6 +885,17 @@ void PathDiagnosticLocation::flatten() {
 
 PathDiagnosticCallPiece *
 PathDiagnosticCallPiece::construct(const ExplodedNode *N,
+                                   const CallSummaryPostApply &CE,
+                                   const SourceManager &SM) {
+  const Decl *caller = CE.getLocationContext()->getDecl();
+  PathDiagnosticLocation pos = getLocationForCaller(CE.getCalleeContext(),
+                                                    CE.getLocationContext(),
+                                                    SM);
+  return new PathDiagnosticCallPiece(caller, pos);
+}
+
+PathDiagnosticCallPiece *
+PathDiagnosticCallPiece::construct(const ExplodedNode *N,
                                    const CallExitEnd &CE,
                                    const SourceManager &SM) {
   const Decl *caller = CE.getLocationContext()->getDecl();
@@ -888,6 +915,15 @@ PathDiagnosticCallPiece::construct(PathPieces &path,
 }
 
 void PathDiagnosticCallPiece::setCallee(const CallEnter &CE,
+                                        const SourceManager &SM) {
+  const StackFrameContext *CalleeCtx = CE.getCalleeContext();
+  Callee = CalleeCtx->getDecl();
+
+  callEnterWithin = PathDiagnosticLocation::createBegin(Callee, SM);
+  callEnter = getLocationForCaller(CalleeCtx, CE.getLocationContext(), SM);
+}
+
+void PathDiagnosticCallPiece::setCallee(const CallSummaryPreApply &CE,
                                         const SourceManager &SM) {
   const StackFrameContext *CalleeCtx = CE.getCalleeContext();
   Callee = CalleeCtx->getDecl();
@@ -1109,11 +1145,16 @@ void PathDiagnostic::FullProfile(llvm::FoldingSetNodeID &ID) const {
 StackHintGenerator::~StackHintGenerator() {}
 
 std::string StackHintGeneratorForSymbol::getMessage(const ExplodedNode *N){
-  ProgramPoint P = N->getLocation();
-  CallExitEnd CExit = P.castAs<CallExitEnd>();
-
   // FIXME: Use CallEvent to abstract this over all calls.
-  const Stmt *CallSite = CExit.getCalleeContext()->getCallSite();
+  ProgramPoint P = N->getLocation();
+  const Stmt *CallSite = NULL;
+  if (Optional<CallExitEnd> CExit = P.getAs<CallExitEnd>())
+    CallSite = CExit->getCalleeContext()->getCallSite();
+  else if (Optional<CallSummaryPreApply> SPre = P.getAs<CallSummaryPreApply>())
+    CallSite = SPre->getCalleeContext()->getCallSite();
+  else if (Optional<CallSummaryPostApply> SPost = P.getAs<CallSummaryPostApply>())
+    CallSite = SPost->getCalleeContext()->getCallSite();
+  assert(CallSite);
   const CallExpr *CE = dyn_cast_or_null<CallExpr>(CallSite);
   if (!CE)
     return "";
@@ -1157,6 +1198,71 @@ std::string StackHintGeneratorForSymbol::getMessage(const ExplodedNode *N){
 
 std::string StackHintGeneratorForSymbol::getMessageForArg(const Expr *ArgE,
                                                           unsigned ArgIndex) {
+  // Printed parameters start at 1, not 0.
+  ++ArgIndex;
+
+  SmallString<200> buf;
+  llvm::raw_svector_ostream os(buf);
+
+  os << Msg << " via " << ArgIndex << llvm::getOrdinalSuffix(ArgIndex)
+     << " parameter";
+
+  return os.str();
+}
+
+std::string StackHintGeneratorForMemRegion::getMessage(const ExplodedNode *N){
+  // FIXME: Use CallEvent to abstract this over all calls.
+  ProgramPoint P = N->getLocation();
+  const Stmt *CallSite = NULL;
+  if (Optional<CallExitEnd> CExit = P.getAs<CallExitEnd>())
+    CallSite = CExit->getCalleeContext()->getCallSite();
+  else if (Optional<CallSummaryPreApply> SPre = P.getAs<CallSummaryPreApply>())
+    CallSite = SPre->getCalleeContext()->getCallSite();
+  else if (Optional<CallSummaryPostApply> SPost = P.getAs<CallSummaryPostApply>())
+    CallSite = SPost->getCalleeContext()->getCallSite();
+  const CallExpr *CE = dyn_cast_or_null<CallExpr>(CallSite);
+  if (!CE)
+    return "";
+
+  if (!N)
+    return getMessageForSymbolNotFound();
+
+  // Check if one of the parameters are set to the interesting symbol.
+  ProgramStateRef State = N->getState();
+  const LocationContext *LCtx = N->getLocationContext();
+  unsigned ArgIndex = 0;
+  for (CallExpr::const_arg_iterator I = CE->arg_begin(),
+                                    E = CE->arg_end(); I != E; ++I, ++ArgIndex){
+    SVal SV = State->getSVal(*I, LCtx);
+
+    // Check if the variable corresponding to the symbol is passed by value.
+    const MemRegion *AM = SV.getAsRegion();
+    if (AM == MR) {
+      return getMessageForArg(*I, ArgIndex);
+    }
+
+    // Check if the parameter is a pointer to the symbol.
+    if (Optional<loc::MemRegionVal> Reg = SV.getAs<loc::MemRegionVal>()) {
+      SVal PSV = State->getSVal(Reg->getRegion());
+      const MemRegion *AM = PSV.getAsRegion();
+      if (AM == MR) {
+        return getMessageForArg(*I, ArgIndex);
+      }
+    }
+  }
+
+  // Check if we are returning the interesting symbol.
+  SVal SV = State->getSVal(CE, LCtx);
+  const MemRegion *RetM = SV.getAsRegion();
+  if (RetM == MR) {
+    return getMessageForReturn(CE);
+  }
+
+  return getMessageForSymbolNotFound();
+}
+
+std::string StackHintGeneratorForMemRegion::getMessageForArg(const Expr *ArgE,
+                                                            unsigned ArgIndex) {
   // Printed parameters start at 1, not 0.
   ++ArgIndex;
 

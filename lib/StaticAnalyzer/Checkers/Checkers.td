@@ -46,6 +46,12 @@ def Containers : Package<"containers">, InPackage<CoreFoundation>;
 def LLVM : Package<"llvm">;
 def Debug : Package<"debug">;
 
+def UndefBehavior : Package<"undefbehavior">;
+def UndefBehaviorAlpha : Package<"undefbehavior">, InPackage<Alpha>, Hidden;
+
+def Different : Package<"different">;
+def DifferentAlpha : Package<"different">, InPackage<Alpha>, Hidden;
+
 //===----------------------------------------------------------------------===//
 // Core Checkers.
 //===----------------------------------------------------------------------===//
@@ -547,3 +553,23 @@ def ExplodedGraphViewer : Checker<"ViewExplodedGraph">,
   DescFile<"DebugCheckers.cpp">;
 
 } // end "debug"
+
+//===----------------------------------------------------------------------===//
+// Different checkers.
+//===----------------------------------------------------------------------===//
+
+let ParentPackage = DifferentAlpha in {
+def IntegerOverflowDef : Checker<"IntegerOverflow">,
+  HelpText<"Check for integer overflow">,
+  DescFile<"IntegerOverflowChecker.cpp">;
+} // end "alpha.different"
+
+//===----------------------------------------------------------------------===//
+// Checkers for undefined behavior.
+//===----------------------------------------------------------------------===//
+
+let ParentPackage = UndefBehaviorAlpha in {
+def ConstModifiedChecker : Checker<"ConstModified">,
+  HelpText<"Warns if variable declared as const or casted from const variable is modified">,
+  DescFile<"ConstModifiedChecker.cpp">;
+}

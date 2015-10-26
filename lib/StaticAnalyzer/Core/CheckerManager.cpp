@@ -29,6 +29,7 @@ bool CheckerManager::hasPathSensitiveCheckers() const {
          !PostCallCheckers.empty()   ||
          !LocationCheckers.empty()          ||
          !BindCheckers.empty()              ||
+         !BeginAnalysisCheckers.empty()     ||
          !EndAnalysisCheckers.empty()       ||
          !EndFunctionCheckers.empty()           ||
          !BranchConditionCheckers.empty()   ||
@@ -36,7 +37,10 @@ bool CheckerManager::hasPathSensitiveCheckers() const {
          !DeadSymbolsCheckers.empty()       ||
          !RegionChangesCheckers.empty()     ||
          !EvalAssumeCheckers.empty()        ||
-         !EvalCallCheckers.empty();
+         !EvalCallCheckers.empty()          ||
+         !EvalSummaryPopulateCheckers.empty() ||
+         !EvalSummaryApplyCheckers.empty()  ||
+         !EvalSummarySValCheckers.empty();
 }
 
 void CheckerManager::finishedCheckerRegistration() {
@@ -343,11 +347,97 @@ void CheckerManager::runCheckersForBind(ExplodedNodeSet &Dst,
   expandGraphWithCheckers(C, Dst, Src);
 }
 
+namespace {
+  struct CheckBeginAnalysisContext {
+    typedef std::vector<CheckerManager::CheckBeginAnalysisFunc> CheckersTy;
+    const CheckersTy &Checkers;
+    ExprEngine &Eng;
+
+    CheckersTy::const_iterator checkers_begin() { return Checkers.begin(); }
+    CheckersTy::const_iterator checkers_end() { return Checkers.end(); }
+
+    CheckBeginAnalysisContext(const CheckersTy &checkers, ExprEngine &eng)
+        : Checkers(checkers), Eng(eng) {}
+    void runChecker(CheckerManager::CheckBeginAnalysisFunc checkFn,
+                    NodeBuilder &Bldr, ExplodedNode *Pred) {
+      const ProgramPoint &L = Pred->getLocation().withTag(checkFn.Checker);
+      CheckerContext C(Bldr, Eng, Pred, L);
+      checkFn(C);
+    }
+  };
+}
+
+void CheckerManager::runCheckersForBeginAnalysis(ExplodedNode *Pred,
+                                                 ExplodedNodeSet &Dst,
+                                                 ExprEngine &Eng) {
+  ExplodedNodeSet Src;
+  Src.insert(Pred);
+  CheckBeginAnalysisContext C(BeginAnalysisCheckers, Eng);
+  expandGraphWithCheckers(C, Dst, Src);
+}
+
 void CheckerManager::runCheckersForEndAnalysis(ExplodedGraph &G,
                                                BugReporter &BR,
                                                ExprEngine &Eng) {
   for (unsigned i = 0, e = EndAnalysisCheckers.size(); i != e; ++i)
     EndAnalysisCheckers[i](G, BR, Eng);
+}
+
+CheckerSummaries
+CheckerManager::runCheckersForEvalSummaryPopulate(ProgramStateRef state) {
+  CheckerSummaries map;
+  for (unsigned i = 0, e = EvalSummaryPopulateCheckers.size(); i != e; ++i)
+    map[EvalSummaryPopulateCheckers[i].Checker] =
+        EvalSummaryPopulateCheckers[i](state);
+  return map;
+}
+
+namespace {
+  struct EvalSummaryApplyContext {
+    typedef std::vector<CheckerManager::EvalSummaryApplyFunc> CheckersTy;
+    const CheckersTy &Checkers;
+
+    ExprEngine &Eng;
+    Summarizer &S;
+    const CallEvent &Call;
+    CheckerSummaries Data;
+    ProgramStateRef CalleeEndState;
+
+    CheckersTy::const_iterator checkers_begin() { return Checkers.begin(); }
+    CheckersTy::const_iterator checkers_end() { return Checkers.end(); }
+
+    EvalSummaryApplyContext(const CheckersTy &checkers, ExprEngine &Eng,
+                            Summarizer &S, const CallEvent &Call,
+                            CheckerSummaries Data,
+                            ProgramStateRef CalleeEndState)
+        : Checkers(checkers), Eng(Eng), S(S), Call(Call), Data(Data),
+          CalleeEndState(CalleeEndState) {}
+
+    void runChecker(CheckerManager::EvalSummaryApplyFunc checkFn,
+                    NodeBuilder &Bldr, ExplodedNode *Pred) {
+      const ProgramPoint &L = Call.getProgramPoint(true, checkFn.Checker);
+      CheckerContext C(Bldr, Eng, Pred, L);
+      checkFn(S, Call, Data[checkFn.Checker], C, CalleeEndState);
+    }
+  };
+}
+
+void CheckerManager::runCheckersForEvalSummaryApply(
+    ExplodedNodeSet &Dst, const ExplodedNodeSet &Src, ExprEngine &Eng,
+    Summarizer &S, const CallEvent &Call, CheckerSummaries Data,
+    ProgramStateRef CalleeEndState) {
+  EvalSummaryApplyContext C(EvalSummaryApplyCheckers, Eng, S, Call, Data,
+                            CalleeEndState);
+  expandGraphWithCheckers(C, Dst, Src);
+}
+
+SVal CheckerManager::runCheckersForEvalSummarySVal(Summarizer &S,
+                                                   SVal SV) {
+  SVal NewVal = SV;
+  for (size_t i = 0, e = EvalSummarySValCheckers.size();
+       i != e && NewVal == SV; ++i)
+    NewVal = EvalSummarySValCheckers[i](S, SV);
+  return NewVal;
 }
 
 /// \brief Run checkers for end of path.
@@ -635,6 +725,10 @@ void CheckerManager::_registerForBind(CheckBindFunc checkfn) {
   BindCheckers.push_back(checkfn);
 }
 
+void CheckerManager::_registerForBeginAnalysis(CheckBeginAnalysisFunc checkfn) {
+  BeginAnalysisCheckers.push_back(checkfn);
+}
+
 void CheckerManager::_registerForEndAnalysis(CheckEndAnalysisFunc checkfn) {
   EndAnalysisCheckers.push_back(checkfn);
 }
@@ -683,6 +777,22 @@ void CheckerManager::_registerForEndOfTranslationUnit(
                                             CheckEndOfTranslationUnit checkfn) {
   EndOfTranslationUnitCheckers.push_back(checkfn);
 }
+
+void CheckerManager::_registerForEvalSummaryPopulate(
+    EvalSummaryPopulateFunc checkfn) {
+  EvalSummaryPopulateCheckers.push_back(checkfn);
+}
+
+void
+CheckerManager::_registerForEvalSummaryApply(EvalSummaryApplyFunc checkfn) {
+  EvalSummaryApplyCheckers.push_back(checkfn);
+}
+
+void
+CheckerManager::_registerForEvalSummarySVal(EvalSummarySValFunc checkfn) {
+  EvalSummarySValCheckers.push_back(checkfn);
+}
+
 
 //===----------------------------------------------------------------------===//
 // Implementation details.

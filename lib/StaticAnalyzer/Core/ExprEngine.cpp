@@ -55,25 +55,22 @@ STATISTIC(NumTimesRetriedWithoutInlining,
 // Engine construction and deletion.
 //===----------------------------------------------------------------------===//
 
-ExprEngine::ExprEngine(AnalysisManager &mgr, bool gcEnabled,
-                       SetOfConstDecls *VisitedCalleesIn,
-                       FunctionSummariesTy *FS,
+ExprEngine::ExprEngine(CompilerInstance &CI, AnalysisManager &mgr,
+                       BasicValueFactory &BVF,
+                       bool gcEnabled, SetOfConstDecls *VisitedCalleesIn,
+                       FunctionSummariesTy *FS, CallSummaryMap *FCS,
+                       SummaryConstructionStack &SCS,
                        InliningModes HowToInlineIn)
-  : AMgr(mgr),
-    AnalysisDeclContexts(mgr.getAnalysisDeclContextManager()),
-    Engine(*this, FS),
-    G(Engine.getGraph()),
-    StateMgr(getContext(), mgr.getStoreManagerCreator(),
-             mgr.getConstraintManagerCreator(), G.getAllocator(),
-             this),
-    SymMgr(StateMgr.getSymbolManager()),
-    svalBuilder(StateMgr.getSValBuilder()),
-    currStmtIdx(0), currBldrCtx(0),
-    ObjCNoRet(mgr.getASTContext()),
-    ObjCGCEnabled(gcEnabled), BR(mgr, *this),
-    VisitedCallees(VisitedCalleesIn),
-    HowToInline(HowToInlineIn)
-{
+    : CI(CI), AMgr(mgr),
+      AnalysisDeclContexts(mgr.getAnalysisDeclContextManager()),
+      Engine(*this, HowToInlineIn, FS, FCS), G(Engine.getGraph()),
+      StateMgr(getContext(), mgr.getStoreManagerCreator(),
+               mgr.getConstraintManagerCreator(), BVF, this),
+      SymMgr(StateMgr.getSymbolManager()),
+      svalBuilder(StateMgr.getSValBuilder()), currStmtIdx(0), currBldrCtx(0),
+      ObjCNoRet(mgr.getASTContext()), ObjCGCEnabled(gcEnabled), BR(mgr, *this),
+      VisitedCallees(VisitedCalleesIn), HowToInline(HowToInlineIn), FS(FS),
+      FCS(FCS), SCS(SCS), numInlinedCalls(0) {
   unsigned TrimInterval = mgr.options.getGraphTrimInterval();
   if (TrimInterval != 0) {
     // Enable eager node reclaimation when constructing the ExplodedGraph.
@@ -176,8 +173,9 @@ ExprEngine::createTemporaryRegionIfNeeded(ProgramStateRef State,
   if (!Result) {
     // If we don't have an explicit result expression, we're in "if needed"
     // mode. Only create a region if the current value is a NonLoc.
-    if (!V.getAs<NonLoc>())
+    if (!V.getAs<NonLoc>()) {
       return State;
+    }
     Result = Ex;
   } else {
     // We need to create a region no matter what. For sanity, make sure we don't
@@ -267,6 +265,14 @@ ExprEngine::processRegionChanges(ProgramStateRef state,
 void ExprEngine::printState(raw_ostream &Out, ProgramStateRef State,
                             const char *NL, const char *Sep) {
   getCheckerManager().runCheckersForPrintState(Out, State, NL, Sep);
+}
+
+void ExprEngine::processBeginWorklist(ExplodedNode *Pred, ExplodedNodeSet &Dst,
+                                      NodeBuilderContext *Ctx) {
+  assert(currBldrCtx == 0);
+  currBldrCtx = Ctx;
+  getCheckerManager().runCheckersForBeginAnalysis(Pred, Dst, *this);
+  currBldrCtx = 0;
 }
 
 void ExprEngine::processEndWorklist(bool hasWorkRemaining) {
@@ -626,10 +632,14 @@ void ExprEngine::ProcessMemberDtor(const CFGMemberDtor D,
                                             LCtx->getCurrentStackFrame());
   SVal FieldVal =
       State->getLValue(Member, State->getSVal(ThisVal).castAs<Loc>());
-
-  VisitCXXDestructor(Member->getType(),
-                     FieldVal.castAs<loc::MemRegionVal>().getRegion(),
+  if (!FieldVal.getAsRegion())
+    VisitCXXDestructor(Member->getType(),
+                     FieldVal.getAsRegion(),
                      CurDtor->getBody(), /*IsBase=*/false, Pred, Dst);
+  else
+    VisitCXXDestructor(Member->getType(),
+                         FieldVal.castAs<loc::MemRegionVal>().getRegion(),
+                         CurDtor->getBody(), /*IsBase=*/false, Pred, Dst);
 }
 
 void ExprEngine::ProcessTemporaryDtor(const CFGTemporaryDtor D,
@@ -949,7 +959,9 @@ void ExprEngine::Visit(const Stmt *S, ExplodedNode *Pred,
     
     case Stmt::CXXCatchStmtClass: {
       Bldr.takeNodes(Pred);
-      VisitCXXCatchStmt(cast<CXXCatchStmt>(S), Pred, Dst);
+      ExplodedNodeSet PostVisit;
+      VisitCXXCatchStmt(cast<CXXCatchStmt>(S), Pred, PostVisit);
+      getCheckerManager().runCheckersForPostStmt(Dst, PostVisit, S, *this);
       Bldr.addNodes(Dst);
       break;
     }
@@ -1103,11 +1115,19 @@ void ExprEngine::Visit(const Stmt *S, ExplodedNode *Pred,
       break;
 
     case Stmt::ObjCAtThrowStmtClass:
-    case Stmt::CXXThrowExprClass:
       // FIXME: This is not complete.  We basically treat @throw as
       // an abort.
       Bldr.generateSink(S, Pred, Pred->getState());
       break;
+
+    case Stmt::CXXThrowExprClass: {
+      Bldr.takeNodes(Pred);
+      ExplodedNodeSet PostVisit;
+      VisitCXXThrowExpr(cast<CXXThrowExpr>(S), Pred, PostVisit);
+      getCheckerManager().runCheckersForPostStmt(Dst, PostVisit, S, *this);
+      Bldr.addNodes(Dst);
+      break;
+    }
 
     case Stmt::ReturnStmtClass:
       Bldr.takeNodes(Pred);
@@ -1307,7 +1327,7 @@ static SVal RecoverCastedSymbol(ProgramStateManager& StateMgr,
   while (const CastExpr *CE = dyn_cast<CastExpr>(Ex)) {
     QualType T = CE->getType();
 
-    if (!T->isIntegralOrEnumerationType())
+    if (!T->isIntegralOrEnumerationType() && !T->isRealFloatingType())
       return UnknownVal();
 
     uint64_t newBits = Ctx.getTypeSize(T);
@@ -1322,7 +1342,7 @@ static SVal RecoverCastedSymbol(ProgramStateManager& StateMgr,
   // We reached a non-cast.  Is it a symbolic value?
   QualType T = Ex->getType();
 
-  if (!bitsInit || !T->isIntegralOrEnumerationType() ||
+  if (!bitsInit || (!T->isIntegralOrEnumerationType() && !T->isRealFloatingType())||
       Ctx.getTypeSize(T) > bits)
     return UnknownVal();
 
@@ -1416,7 +1436,8 @@ void ExprEngine::processBranch(const Stmt *Condition, const Stmt *Term,
     if (X.isUnknownOrUndef()) {
       // Give it a chance to recover from unknown.
       if (const Expr *Ex = dyn_cast<Expr>(Condition)) {
-        if (Ex->getType()->isIntegralOrEnumerationType()) {
+        if (Ex->getType()->isIntegralOrEnumerationType() ||
+            Ex->getType()->isRealFloatingType()) {
           // Try to recover some path-sensitivity.  Right now casts of symbolic
           // integers that promote their values are currently not tracked well.
           // If 'Condition' is such an expression, try and recover the
@@ -1567,8 +1588,9 @@ void ExprEngine::processEndOfFunction(NodeBuilderContext& BC,
 void ExprEngine::processSwitch(SwitchNodeBuilder& builder) {
   typedef SwitchNodeBuilder::iterator iterator;
   ProgramStateRef state = builder.getState();
+  const LocationContext *LCtx = builder.getLocationContext();
   const Expr *CondE = builder.getCondition();
-  SVal  CondV_untested = state->getSVal(CondE, builder.getLocationContext());
+  SVal  CondV_untested = state->getSVal(CondE, LCtx);
 
   if (CondV_untested.isUndef()) {
     //ExplodedNode* N = builder.generateDefaultCaseNode(state, true);
@@ -1578,6 +1600,11 @@ void ExprEngine::processSwitch(SwitchNodeBuilder& builder) {
     return;
   }
   DefinedOrUnknownSVal CondV = CondV_untested.castAs<DefinedOrUnknownSVal>();
+  if (CondV.isUnknown()) {
+    CondV = state->getStateManager().getSValBuilder().conjureSymbolVal(NULL,
+          CondE, LCtx, builder.getBuilderContext()->blockCount());
+    state = state->BindExpr(CondE, LCtx, CondV);
+  }
 
   ProgramStateRef DefaultSt = state;
   
@@ -1601,48 +1628,24 @@ void ExprEngine::processSwitch(SwitchNodeBuilder& builder) {
       V2 = E->EvaluateKnownConstInt(getContext());
     else
       V2 = V1;
+    ProgramStateRef stateNew;
+    assert(CondV.getAs<NonLoc>());
+    NonLoc NL = CondV.castAs<NonLoc>();
+    llvm::tie(stateNew, DefaultSt) = DefaultSt->getConstraintManager()
+        .assumeBoundDual(DefaultSt, NL, V1, V2);
 
-    // FIXME: Eventually we should replace the logic below with a range
-    //  comparison, rather than concretize the values within the range.
-    //  This should be easy once we have "ranges" for NonLVals.
+    // Now "assume" that the case matches.
+    if (stateNew)
+      builder.generateCaseStmtNode(I, stateNew);
 
-    do {
-      nonloc::ConcreteInt CaseVal(getBasicVals().getValue(V1));
-      DefinedOrUnknownSVal Res = svalBuilder.evalEQ(DefaultSt ? DefaultSt : state,
-                                               CondV, CaseVal);
-
-      // Now "assume" that the case matches.
-      if (ProgramStateRef stateNew = state->assume(Res, true)) {
-        builder.generateCaseStmtNode(I, stateNew);
-
-        // If CondV evaluates to a constant, then we know that this
-        // is the *only* case that we can take, so stop evaluating the
-        // others.
-        if (CondV.getAs<nonloc::ConcreteInt>())
-          return;
-      }
-
-      // Now "assume" that the case doesn't match.  Add this state
-      // to the default state (if it is feasible).
-      if (DefaultSt) {
-        if (ProgramStateRef stateNew = DefaultSt->assume(Res, false)) {
-          defaultIsFeasible = true;
-          DefaultSt = stateNew;
-        }
-        else {
-          defaultIsFeasible = false;
-          DefaultSt = NULL;
-        }
-      }
-
-      // Concretize the next value in the range.
-      if (V1 == V2)
-        break;
-
-      ++V1;
-      assert (V1 <= V2);
-
-    } while (true);
+    // Now "assume" that the case doesn't match.  Add this state
+    // to the default state (if it is feasible).
+    if (DefaultSt)
+      defaultIsFeasible = true;
+    else {
+      defaultIsFeasible = false;
+      break;
+    }
   }
 
   if (!defaultIsFeasible)
@@ -1681,7 +1684,7 @@ void ExprEngine::VisitCommonDeclRefExpr(const Expr *Ex, const NamedDecl *D,
     // C permits "extern void v", and if you cast the address to a valid type,
     // you can even do things with it. We simply pretend 
     assert(Ex->isGLValue() || VD->getType()->isVoidType());
-    SVal V = state->getLValue(VD, Pred->getLocationContext());
+    SVal V = state->getLValue(VD, LCtx);
 
     // For references, the 'lvalue' is the pointer address stored in the
     // reference region.
@@ -1691,8 +1694,8 @@ void ExprEngine::VisitCommonDeclRefExpr(const Expr *Ex, const NamedDecl *D,
       else
         V = UnknownVal();
     }
-
-    Bldr.generateNode(Ex, Pred, state->BindExpr(Ex, LCtx, V), 0,
+    state = state->BindExpr(Ex, LCtx, V);
+    Bldr.generateNode(Ex, Pred, state, 0,
                       ProgramPoint::PostLValueKind);
     return;
   }
@@ -1937,7 +1940,6 @@ void ExprEngine::evalBind(ExplodedNodeSet &Dst, const Stmt *StoreE,
                           ExplodedNode *Pred,
                           SVal location, SVal Val,
                           bool atDeclInit, const ProgramPoint *PP) {
-
   const LocationContext *LC = Pred->getLocationContext();
   PostStmt PS(StoreE, LC);
   if (!PP)
@@ -1949,7 +1951,7 @@ void ExprEngine::evalBind(ExplodedNodeSet &Dst, const Stmt *StoreE,
                                          StoreE, *this, *PP);
 
 
-  StmtNodeBuilder Bldr(CheckedSet, Dst, *currBldrCtx);
+  NodeBuilder Bldr(CheckedSet, Dst, *currBldrCtx);
 
   // If the location is not a 'Loc', it will already be handled by
   // the checkers.  There is nothing left to do.
@@ -2086,6 +2088,9 @@ void ExprEngine::evalLoadCommon(ExplodedNodeSet &Dst,
       if (LoadTy.isNull())
         LoadTy = BoundEx->getType();
       V = state->getSVal(location.castAs<Loc>(), LoadTy);
+      if (V.isUnknown())
+        V = state->getStateManager().getSValBuilder().conjureSymbolVal(BoundEx,
+              LCtx, LoadTy, getBuilderContext().blockCount());
     }
 
     Bldr.generateNode(NodeEx, *NI, state->BindExpr(BoundEx, LCtx, V), tag,
@@ -2281,6 +2286,27 @@ struct DOTGraphTraits<ExplodedNode*> :
 
       case ProgramPoint::BlockExitKind:
         assert (false);
+        break;
+
+      case ProgramPoint::CallSummaryPreApplyKind:
+        Out << "CallSummaryPreApply: ";
+        {
+          const Stmt *S = Loc.castAs<CallSummaryPreApply>().getCallExpr();
+
+          Out << S->getStmtClassName() << ' ' << (const void*) S << ' ';
+          S->printPretty(Out, 0, PrintingPolicy(LangOptions())); // FIXME
+          printLocation(Out, S->getLocStart());
+        }
+        break;
+      case ProgramPoint::CallSummaryPostApplyKind:
+        Out << "CallSummaryPostApply: ";
+        {
+          const Stmt *S = Loc.castAs<CallSummaryPostApply>().getCallExpr();
+
+          Out << S->getStmtClassName() << ' ' << (const void*) S << ' ';
+          S->printPretty(Out, 0, PrintingPolicy(LangOptions())); // FIXME
+          printLocation(Out, S->getLocStart());
+        }
         break;
 
       case ProgramPoint::CallEnterKind:

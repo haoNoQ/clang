@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerHelpers.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h"
 #include "clang/AST/Expr.h"
 
 // Recursively find any substatements containing macros
@@ -78,3 +79,37 @@ bool clang::ento::containsBuiltinOffsetOf(const Stmt *S) {
 
   return false;
 }
+
+std::string clang::ento::dumpMemRegion(const MemRegion *MR,
+                                       const Environment &Env,
+                                       const PrintingPolicy &Pr,
+                                       const std::string &Default) {
+  std::string MsgStr;
+  llvm::raw_string_ostream Msg(MsgStr);
+  if (MR->canPrintPretty())
+    MR->printPretty(Msg);
+  else {
+    // FIXME: this should be implemented in more convenient way...
+    for (Environment::iterator I = Env.begin(); I != Env.end(); ++I)
+      if (I->second.getAsRegion() == MR) {
+        const EnvironmentEntry &E = I->first;
+        Msg << "'";
+        E.getStmt()->printPretty(Msg, NULL, Pr);
+        Msg << "'";
+        break;
+      }
+  }
+  if (!Msg.GetNumBytesInBuffer())
+    return Default;
+  return Msg.str();
+}
+
+namespace clang {
+namespace ento {
+
+RegionSet toRegionSet(const llvm::ImmutableSet<const MemRegion *> &ImmSet) {
+  return toSet<const MemRegion *>(ImmSet);
+}
+
+} // end namespace ento
+} // end namespace clang

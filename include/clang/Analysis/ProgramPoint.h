@@ -34,6 +34,10 @@ class AnalysisDeclContext;
 class FunctionDecl;
 class LocationContext;
 class ProgramPointTag;
+
+namespace ento {
+class ExplodedNode;
+}
   
 class ProgramPoint {
 public:
@@ -53,6 +57,8 @@ public:
               MinPostStmtKind = PostStmtKind,
               MaxPostStmtKind = PostLValueKind,
               PostInitializerKind,
+              CallSummaryPreApplyKind,
+              CallSummaryPostApplyKind,
               CallEnterKind,
               CallExitBeginKind,
               CallExitEndKind,
@@ -65,6 +71,7 @@ public:
 private:
   const void *Data1;
   llvm::PointerIntPair<const void *, 2, unsigned> Data2;
+  const void *Data3;
 
   // The LocationContext could be NULL to allow ProgramPoint to be used in
   // context insensitive analysis.
@@ -80,6 +87,7 @@ protected:
                const ProgramPointTag *tag = 0)
     : Data1(P),
       Data2(0, (((unsigned) k) >> 0) & 0x3),
+      Data3(NULL),
       L(l, (((unsigned) k) >> 2) & 0x3),
       Tag(tag, (((unsigned) k) >> 4) & 0x3) {
         assert(getKind() == k);
@@ -94,12 +102,26 @@ protected:
                const ProgramPointTag *tag = 0)
     : Data1(P1),
       Data2(P2, (((unsigned) k) >> 0) & 0x3),
+      Data3(NULL),
+      L(l, (((unsigned) k) >> 2) & 0x3),
+      Tag(tag, (((unsigned) k) >> 4) & 0x3) {}
+
+  ProgramPoint(const void *P1,
+               const void *P2,
+               const void *P3,
+               Kind k,
+               const LocationContext *l,
+               const ProgramPointTag *tag = 0)
+    : Data1(P1),
+      Data2(P2, (((unsigned) k) >> 0) & 0x3),
+      Data3(P3),
       L(l, (((unsigned) k) >> 2) & 0x3),
       Tag(tag, (((unsigned) k) >> 4) & 0x3) {}
 
 protected:
   const void *getData1() const { return Data1; }
   const void *getData2() const { return Data2.getPointer(); }
+  const void *getData3() const { return Data3; }
   void setData2(const void *d) { Data2.setPointer(d); }
 
 public:
@@ -553,6 +575,64 @@ private:
   PostImplicitCall() {}
   static bool isKind(const ProgramPoint &Location) {
     return Location.getKind() == PostImplicitCallKind;
+  }
+};
+
+/// Represents a point when we applying summary for a call.
+/// CallSummaryPreApply uses the caller's location context
+/// (no location context transition occured).
+class CallSummaryPreApply : public ProgramPoint {
+public:
+  CallSummaryPreApply(const Stmt *stmt, const StackFrameContext *calleeCtx,
+                   const LocationContext *callerCtx,
+                   const ProgramPointTag *Tag = NULL)
+      : ProgramPoint(stmt, calleeCtx, CallSummaryPreApplyKind, callerCtx, Tag) {}
+
+  const Stmt *getCallExpr() const {
+    return static_cast<const Stmt *>(getData1());
+  }
+
+  const StackFrameContext *getCalleeContext() const {
+    return static_cast<const StackFrameContext *>(getData2());
+  }
+
+private:
+  friend class ProgramPoint;
+  CallSummaryPreApply() {}
+  static bool isKind(const ProgramPoint &Location) {
+    return Location.getKind() == CallSummaryPreApplyKind;
+  }
+};
+
+/// Represents a point when we applying summary for a call.
+/// CallSummaryPostApply uses the caller's location context
+/// (no location context transition occured).
+class CallSummaryPostApply : public ProgramPoint {
+public:
+  CallSummaryPostApply(const Stmt *stmt, const StackFrameContext *calleeCtx,
+                       const ento::ExplodedNode *Node,
+                       const LocationContext *callerCtx,
+                       const ProgramPointTag *Tag = NULL)
+      : ProgramPoint(stmt, calleeCtx, Node, CallSummaryPostApplyKind,
+                     callerCtx, Tag) {}
+
+  const Stmt *getCallExpr() const {
+    return static_cast<const Stmt *>(getData1());
+  }
+
+  const StackFrameContext *getCalleeContext() const {
+    return static_cast<const StackFrameContext *>(getData2());
+  }
+
+  const ento::ExplodedNode *getReferenceNode() const {
+    return static_cast<const ento::ExplodedNode *>(getData3());
+  }
+
+private:
+  friend class ProgramPoint;
+  CallSummaryPostApply() {}
+  static bool isKind(const ProgramPoint &Location) {
+    return Location.getKind() == CallSummaryPostApplyKind;
   }
 };
 

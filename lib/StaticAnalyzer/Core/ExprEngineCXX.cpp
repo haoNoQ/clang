@@ -11,16 +11,22 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/StaticAnalyzer/Core/PathSensitive/CoreEngine.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ExprEngine.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/StmtCXX.h"
+#include "clang/Analysis/CFGStmtMap.h"
 #include "clang/Basic/PrettyStackTrace.h"
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/AnalysisManager.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 
 using namespace clang;
 using namespace ento;
+
+// save type from 'throw' expression
+REGISTER_LIST_WITH_PROGRAMSTATE(ThrowType, const QualType)
 
 void ExprEngine::CreateCXXTemporaryObject(const MaterializeTemporaryExpr *ME,
                                           ExplodedNode *Pred,
@@ -65,7 +71,7 @@ void ExprEngine::performTrivialCopy(NodeBuilder &Bldr, ExplodedNode *Pred,
   if (Optional<Loc> L = V.getAs<Loc>())
     V = Pred->getState()->getSVal(*L);
   else
-    assert(V.isUnknown());
+    assert(V.isUnknownOrUndef());
 
   const Expr *CallExpr = Call.getOriginExpr();
   evalBind(Dst, CallExpr, Pred, ThisVal, V, true);
@@ -272,6 +278,11 @@ void ExprEngine::VisitCXXConstructExpr(const CXXConstructExpr *CE,
          I != E; ++I)
       performTrivialCopy(Bldr, *I, *Call);
 
+  } else if (CE->getConstructor()->isTrivial() &&
+             CE->getConstructor()->isDefaultConstructor() &&
+             cast<CXXRecordDecl>(CE->getConstructor()->getDeclContext())
+                 ->isPOD()) {
+    // do nothing.
   } else {
     for (ExplodedNodeSet::iterator I = DstPreCall.begin(), E = DstPreCall.end();
          I != E; ++I)
@@ -439,6 +450,83 @@ void ExprEngine::VisitCXXDeleteExpr(const CXXDeleteExpr *CDE,
   StmtNodeBuilder Bldr(Pred, Dst, *currBldrCtx);
   ProgramStateRef state = Pred->getState();
   Bldr.generateNode(CDE, Pred, state);
+}
+
+void ExprEngine::VisitCXXThrowExpr(const CXXThrowExpr *CTE,
+                                    ExplodedNode *Pred, ExplodedNodeSet &Dst) {
+  StmtNodeBuilder Bldr(Pred, Dst, *currBldrCtx);
+  ProgramStateRef state = Pred->getState();
+
+  const Expr *expr = CTE->getSubExpr();
+  QualType type;
+  if (expr) {
+    type = expr->getType();
+  } /* else 'throw' without arguments */
+
+  state = state->add<ThrowType>(type);
+  Bldr.generateNode(CTE, Pred, state);
+}
+
+/// Called by CoreEngine. Used to generate successor
+/// nodes by processing the 'effects' of a try statement.
+void ExprEngine::processCXXTry(CXXTryNodeBuilder& builder) {
+  ProgramStateRef state = builder.getState();
+  if (!isExceptionThrown(builder.getState())) {
+    // no throws, select default successor
+    builder.generateNode(builder.getDefaultSuccessor(), state);
+    return;
+  }
+  const QualType throwType = getThrownExceptionType(state);
+  const CXXTryStmt *tb = builder.getTry();
+  const CXXCatchStmt *selectedHandler;
+  bool found = false;
+  for (unsigned int i = 0; i < tb->getNumHandlers() && !found; i++) {
+    const CXXCatchStmt *handler = tb->getHandler(i);
+    const QualType type = handler->getCaughtType();
+    if (type.isNull()) {
+      // catch all handler
+      found = true;
+    } else if (!throwType.isNull()) {
+      if (type == throwType
+          || isTypeDerived(type.getTypePtr(), throwType.getTypePtr())) {
+        found = true;
+      }
+    }
+    if (found) {
+      selectedHandler = handler;
+    }
+  }
+  if (found) {
+    // select CFGBlock with selected handler
+    CFGStmtMap *CM = builder.getLocationContext()->getAnalysisDeclContext()->getCFGStmtMap();
+    const CFGBlock *B = CM->getBlock(selectedHandler);
+    assert(B && "can't find catch handler");
+    state = state->remove<ThrowType>();
+    builder.generateNode(B, state);
+  } else {
+    // select exit block
+    const CFGBlock& E = builder.getLocationContext()->getCFG()->getExit();
+    builder.generateNode(&E, state);
+  }
+}
+
+bool ExprEngine::isTypeDerived(const Type* parent, const Type* child) {
+  CXXRecordDecl *PR = parent->getAsCXXRecordDecl();
+  CXXRecordDecl *CR = child->getAsCXXRecordDecl();
+  if (PR && CR) {
+    return CR->isDerivedFrom(PR);
+  }
+  return false;
+}
+
+bool ExprEngine::isExceptionThrown(ProgramStateRef State) const {
+  ThrowTypeTy list = State->get<ThrowType>();
+  return !list.isEmpty();
+}
+
+QualType ExprEngine::getThrownExceptionType(ProgramStateRef State) const {
+  ThrowTypeTy list = State->get<ThrowType>();
+  return list.getHead();
 }
 
 void ExprEngine::VisitCXXCatchStmt(const CXXCatchStmt *CS,

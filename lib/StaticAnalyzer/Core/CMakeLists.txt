@@ -25,6 +25,7 @@ add_clang_library(clangStaticAnalyzerCore
   ExprEngineCallAndReturn.cpp
   ExprEngineObjC.cpp
   FunctionSummary.cpp
+  FunctionCallSummary.cpp
   HTMLDiagnostics.cpp
   MemRegion.cpp
   PathDiagnostic.cpp

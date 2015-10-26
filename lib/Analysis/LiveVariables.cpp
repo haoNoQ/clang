@@ -512,7 +512,7 @@ LiveVariables::computeLiveness(AnalysisDeclContext &AC,
 
   // The analysis currently has scalability issues for very large CFGs.
   // Bail out if it looks too large.
-  if (cfg->getNumBlockIDs() > 300000)
+  if (cfg->getNumBlockIDs() > 10000)
     return 0;
 
   LiveVariablesImpl *LV = new LiveVariablesImpl(AC, killAtAssign);

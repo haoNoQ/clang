@@ -24,6 +24,8 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/SVals.h"
 #include "llvm/ADT/PointerIntPair.h"
+#include "clang/Frontend/ASTUnit.h"
+
 
 namespace clang {
 class ProgramPoint;
@@ -140,6 +142,10 @@ private:
   void Release() const;
 
 protected:
+  typedef std::map<std::string, std::string> FunctionFileMapping;
+  typedef std::map<std::string, clang::ASTUnit*> FunctionAstUnitMapping;
+  typedef std::map<std::string, clang::ASTUnit*> FileASTUnitMapping;
+
   friend class CallEventManager;
 
   CallEvent(const Expr *E, ProgramStateRef state, const LocationContext *lctx)
@@ -345,6 +351,11 @@ public:
 private:
   typedef std::const_mem_fun_t<QualType, ParmVarDecl> get_type_fun;
   
+protected:
+  static FileASTUnitMapping FileASTUnitMap;
+  static FunctionAstUnitMapping FunctionAstUnitMap;
+  static FunctionFileMapping FunctionFileMap;
+
 public:
   typedef const ParmVarDecl * const *param_iterator;
 
@@ -402,20 +413,7 @@ public:
     return cast<FunctionDecl>(CallEvent::getDecl());
   }
 
-  virtual RuntimeDefinition getRuntimeDefinition() const {
-    const FunctionDecl *FD = getDecl();
-    // Note that the AnalysisDeclContext will have the FunctionDecl with
-    // the definition (if one exists).
-    if (FD) {
-      AnalysisDeclContext *AD =
-        getLocationContext()->getAnalysisDeclContext()->
-        getManager()->getContext(FD);
-      if (AD->getBody())
-        return RuntimeDefinition(AD->getDecl());
-    }
-
-    return RuntimeDefinition();
-  }
+  virtual RuntimeDefinition getRuntimeDefinition() const;
 
   virtual bool argumentsMayEscape() const;
 

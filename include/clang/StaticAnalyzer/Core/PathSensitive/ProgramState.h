@@ -57,6 +57,15 @@ template <typename T> struct ProgramStateTrait {
   }
 };
 
+struct OffsetBind {
+  Loc Dest;
+  SVal Value;
+  uint64_t Offset;
+  bool IsDirect;
+  OffsetBind(Loc LV, SVal V, uint64_t Offset, bool isDirect):
+    Dest(LV), Value(V), Offset(Offset), IsDirect(isDirect) {}
+};
+
 /// \class ProgramState
 /// ProgramState - This class encapsulates:
 ///
@@ -209,6 +218,13 @@ public:
   ProgramStateRef bindLoc(Loc location,
                           SVal V,
                           bool notifyChanges = true) const;
+
+  ProgramStateRef bindLocByOffset(Loc location, SVal V, uint64_t Offset,
+                                  bool isDirect = true,
+                                  bool notifyChanges = true) const;
+
+  ProgramStateRef bindLocsByOffset(ArrayRef<OffsetBind> Binds,
+                                   bool notifyChanges = true) const;
 
   ProgramStateRef bindLoc(SVal location, SVal V) const;
 
@@ -437,6 +453,9 @@ class ProgramStateManager {
   friend class ProgramState;
   friend void ProgramStateRelease(const ProgramState *state);
 private:
+  /// A BumpPtrAllocator to allocate states.
+  llvm::BumpPtrAllocator &Alloc;
+
   /// Eng - The SubEngine that owns this state manager.
   SubEngine *Eng; /* Can be null. */
 
@@ -459,17 +478,14 @@ private:
   /// Manages memory for created CallEvents.
   OwningPtr<CallEventManager> CallEventMgr;
 
-  /// A BumpPtrAllocator to allocate states.
-  llvm::BumpPtrAllocator &Alloc;
-  
   /// A vector of ProgramStates that we can reuse.
-  std::vector<ProgramState *> freeStates;
+  static std::vector<ProgramState *> freeStates;
 
 public:
   ProgramStateManager(ASTContext &Ctx,
                  StoreManagerCreator CreateStoreManager,
                  ConstraintManagerCreator CreateConstraintManager,
-                 llvm::BumpPtrAllocator& alloc,
+                 BasicValueFactory& BVF,
                  SubEngine *subeng);
 
   ~ProgramStateManager();
@@ -502,6 +518,8 @@ public:
   const MemRegionManager& getRegionManager() const {
     return svalBuilder->getRegionManager();
   }
+
+  void printStats() const;
 
   CallEventManager &getCallEventManager() { return *CallEventMgr; }
 

@@ -105,6 +105,11 @@ def analyzer_disable_checker : Separate<["-"], "analyzer-disable-checker">,
 def analyzer_disable_checker_EQ : Joined<["-"], "analyzer-disable-checker=">,
   Alias<analyzer_disable_checker>;
 
+def analyzer_checker_option : Separate<["-"], "analyzer-checker-option">,
+  HelpText<"Specify checker-specific settings">;
+def analyzer_checker_option_EQ : Joined<["-"], "analyzer-checker-option=">,
+  Alias<analyzer_checker_option>;
+
 def analyzer_checker_help : Flag<["-"], "analyzer-checker-help">,
   HelpText<"Display the list of analyzer checkers that are available">;
 

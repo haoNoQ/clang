@@ -153,6 +153,7 @@ public:
   }
 
   const ProgramStateRef &getState() const { return State; }
+  void setState(ProgramStateRef NewState) { State = NewState; }
 
   template <typename T>
   Optional<T> getLocationAs() const LLVM_LVALUE_FUNCTION {
@@ -252,6 +253,8 @@ protected:
 
   // Type definitions.
   typedef std::vector<ExplodedNode *> NodeVector;
+  typedef llvm::FoldingSet<ExplodedNode> NodeSet;
+
 
   /// The roots of the simulation graph. Usually there will be only
   /// one, but clients are free to establish multiple subgraphs within a single
@@ -264,20 +267,20 @@ protected:
   NodeVector EndNodes;
 
   /// Nodes - The nodes in the graph.
-  llvm::FoldingSet<ExplodedNode> Nodes;
+  NodeSet Nodes;
 
   /// BVC - Allocator and context for allocating nodes and their predecessor
   /// and successor groups.
-  BumpVectorContext BVC;
+  static BumpVectorContext BVC;
+
+  /// A list of nodes that can be reused.
+  static NodeVector FreeNodes;
 
   /// NumNodes - The number of nodes in the graph.
   unsigned NumNodes;
-  
+
   /// A list of recently allocated nodes that can potentially be recycled.
   NodeVector ChangedNodes;
-  
-  /// A list of nodes that can be reused.
-  NodeVector FreeNodes;
   
   /// Determines how often nodes are reclaimed.
   ///
@@ -300,6 +303,8 @@ public:
   ExplodedGraph* MakeEmptyGraph() const {
     return new ExplodedGraph();
   }
+
+  void ReclaimIneffectiveNodes();
 
   /// addRoot - Add an untyped node to the set of roots.
   ExplodedNode *addRoot(ExplodedNode *V) {
@@ -391,8 +396,9 @@ public:
   static bool isInterestingLValueExpr(const Expr *Ex);
 
 private:
-  bool shouldCollect(const ExplodedNode *node);
+  bool shouldCollect(const ExplodedNode *node, bool Aggressive = false);
   void collectNode(ExplodedNode *node);
+  void collectAllNodes();
 };
 
 class ExplodedNodeSet {

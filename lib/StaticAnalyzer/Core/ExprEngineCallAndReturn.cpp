@@ -18,12 +18,21 @@
 #include "clang/AST/CXXInheritance.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/ParentMap.h"
+#include "clang/Analysis/CFGStmtMap.h"
 #include "clang/Analysis/Analyses/LiveVariables.h"
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/SaveAndRestore.h"
+#include <ctime>
+#include <sys/file.h>
+#include <unistd.h>
+#include "clang/AST/Mangle.h"
+#include "llvm/ADT/Triple.h"
+#include "clang/Basic/TargetInfo.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
+#include <sstream>
 
 using namespace clang;
 using namespace ento;
@@ -211,7 +220,7 @@ static bool isTemporaryPRValue(const CXXConstructExpr *E, SVal V) {
 /// CallExitBegin and CallExitEnd. The following operations occur between the 
 /// two program points:
 /// 1. CallExitBegin (triggers the start of call exit sequence)
-/// 2. Bind the return value
+/// 2. Bind the return value or process thrown exception
 /// 3. Run Remove dead bindings to clean up the dead symbols from the callee.
 /// 4. CallExitEnd (switch to the caller context)
 /// 5. PostStmt<CallExpr>
@@ -332,6 +341,33 @@ void ExprEngine::processCallExit(ExplodedNode *CEBNode) {
                                                *UpdatedCall, *this,
                                                /*WasInlined=*/true);
 
+    if (CE && isExceptionThrown(state)) {
+      // search CXXTryStmt by up traverse AST from current call expression
+      ParentMap& PM = CEENode->getLocationContext()->getParentMap();
+      const Stmt *S = CE;
+      while (S->getStmtClass() != Stmt::CXXTryStmtClass) {
+        S = PM.getParent(S);
+        if (!S) break;
+      }
+      const CFGBlock *NB;
+      if (S) {
+        // search block with CXXTryStmt terminator
+        CFGStmtMap *SM = CEENode->getLocationContext()->getAnalysisDeclContext()->getCFGStmtMap();
+        NB = SM->getBlock(S);
+      } else {
+        // enqueue exit block
+        NB = &CEENode->getLocationContext()->getCFG()->getExit();
+      }
+      if (NB) {
+        bool IsNew;
+        ExplodedNode *Node = G.getNode(BlockEdge(Blk, NB, CEENode->getLocationContext()),
+                                            state, false, &IsNew);
+        Node->addPredecessor(CEENode, G);
+        if (IsNew) Engine.getWorkList()->enqueue(Node);
+        return;
+      }
+    }
+
     ExplodedNodeSet Dst;
     if (const ObjCMethodCall *Msg = dyn_cast<ObjCMethodCall>(Call)) {
       getCheckerManager().runCheckersForPostObjCMessage(Dst, DstPostCall, *Msg,
@@ -360,7 +396,7 @@ void ExprEngine::examineStackFrames(const Decl *D, const LocationContext *LCtx,
 
   while (LCtx) {
     if (const StackFrameContext *SFC = dyn_cast<StackFrameContext>(LCtx)) {
-      const Decl *DI = SFC->getDecl();
+      const Decl *DI = SFC->getDecl()->getCanonicalDecl();
 
       // Mark recursive (and mutually recursive) functions and always count
       // them when measuring the stack depth.
@@ -413,56 +449,180 @@ REGISTER_TRAIT_WITH_PROGRAMSTATE(DynamicDispatchBifurcationMap,
                                  CLANG_ENTO_PROGRAMSTATE_MAP(const MemRegion *,
                                                              unsigned))
 
+extern std::string getMangledName(const NamedDecl *ND, MangleContext *MangleCtx);
+
+static void lockedWrite(const std::string &fileName, const std::string &content) {
+  if (!content.empty()) {
+    int fd = open(fileName.c_str(), O_CREAT|O_WRONLY|O_APPEND, 0777);
+    flock(fd, LOCK_EX);
+    write(fd, content.c_str(), content.length());
+    flock(fd, LOCK_UN);
+    close(fd);
+  }
+}
+
+
 bool ExprEngine::inlineCall(const CallEvent &Call, const Decl *D,
                             NodeBuilder &Bldr, ExplodedNode *Pred,
                             ProgramStateRef State) {
-  assert(D);
+  if (HowToInline == Inline_Summary) {
+    ++numInlinedCalls;
+    D = D->getCanonicalDecl();
+    const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+    CallSummaryMap::const_iterator I = FCS->find(D);
 
-  const LocationContext *CurLC = Pred->getLocationContext();
-  const StackFrameContext *CallerSFC = CurLC->getCurrentStackFrame();
-  const LocationContext *ParentOfCallee = CallerSFC;
-  if (Call.getKind() == CE_Block) {
-    const BlockDataRegion *BR = cast<BlockCall>(Call).getBlockRegion();
-    assert(BR && "If we have the block definition we should have its region");
-    AnalysisDeclContext *BlockCtx = AMgr.getAnalysisDeclContext(D);
-    ParentOfCallee = BlockCtx->getBlockInvocationContext(CallerSFC,
-                                                         cast<BlockDecl>(D),
-                                                         BR);
+    if (I == FCS->end()) { // There is no summary in cache now so collect it.
+      // FIXME: Unify this code with AnalysisConsumer::ActionExprEngine
+      // it was taken from
+      if (!AMgr.getCFG(D)) {
+        return false;
+      }
+
+      // See if the LiveVariables analysis scales.
+      if (!AMgr.getAnalysisDeclContext(D)
+               ->getAnalysis<RelaxedLiveVariables>()) {
+        return false;
+      }
+
+      SCS.push_back(D);
+      ExprEngine *Eng =
+          new ExprEngine(CI, AMgr, State->getBasicVals(), ObjCGCEnabled,
+                         VisitedCallees, FS, FCS, SCS, HowToInline);
+
+      // Set the graph auditor.
+      /*    OwningPtr<ExplodedNode::Auditor> Auditor;
+          if (Mgr->options.visualizeExplodedGraphWithUbiGraph) {
+            Auditor.reset(CreateUbiViz());
+            ExplodedNode::SetAuditor(Auditor.get());
+          }*/
+
+      // Execute the worklist algorithm.
+      clock_t begin = clock();
+      const StackFrameContext *SFC =
+          AMgr.getAnalysisDeclContextManager().getStackFrame(D);
+      bool Exceeded = Eng->ExecuteWorkList(
+          SFC, AMgr.options.getMaxNodesPerTopLevelFunction());
+      SCS.pop_back();
+      (*FCS)[D].isValid = !Exceeded;
+      (*FCS)[D].NodesProceed = Engine.FunctionSummaries->getNodesCount(D);
+
+      // Release the auditor (if any) so that it doesn't monitor the graph
+      // created BugReporter.
+      ExplodedNode::SetAuditor(0);
+
+      // Visualize the exploded graph.
+      if (AMgr.options.visualizeExplodedGraphWithGraphViz)
+        Eng->ViewGraph(AMgr.options.TrimGraph);
+
+      // Display warnings.
+      Eng->getBugReporter().FlushReports();
+      clock_t end = clock();
+      double elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
+
+      IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts = new DiagnosticOptions();
+      TextDiagnosticPrinter *DiagClient =
+        new TextDiagnosticPrinter(llvm::errs(), &*DiagOpts);
+      IntrusiveRefCntPtr<DiagnosticIDs> DiagID(new DiagnosticIDs());
+      DiagnosticsEngine Diags(DiagID, &*DiagOpts, DiagClient);
+      const FunctionDecl *FD = cast<FunctionDecl>(D);
+      llvm::OwningPtr<MangleContext> MangleCtx(ItaniumMangleContext::create(
+            FD->getASTContext(), Diags));
+      MangleCtx->setShouldForceMangleProto(true);
+      std::string MangledFnName = getMangledName(FD, MangleCtx.get());
+      std::ostringstream sstream;
+      llvm::errs() << MangledFnName << " " << (Eng->hasEmptyWorkList()
+                                               ? "empty" : "has_work") << "_wl "
+                   << (Eng->wasBlocksExhausted() ? "block_exhausted"
+                                                 : "not_exhausted") << " "
+                   << (Eng->getCoreEngine().wasBlockAborted()
+                              ? "has" : "no") << "_block_aborted "
+                   << Engine.FunctionSummaries->getNodesCount(D) << "\n";
+      sstream << MangledFnName << " " << elapsed_secs << "\n";
+      lockedWrite("time.txt", sstream.str());
+
+      if (Exceeded) {
+        delete Eng;
+      } else {
+        Eng->getGraph().ReclaimIneffectiveNodes();
+      }
+
+    }
+
+    // Now we can definetely say that Summary exists in cache
+    const FunctionCallSummary &Summary = (*FCS)[D];
+    if (Summary.isValid && !Summary.empty()) {
+      // Construct a sensible stack frame context, even though we won't
+      // use it for inlining, our bug reporter still needs some to produce
+      // sensible reports. TODO: Merge with the inlining code below.
+      const LocationContext *CurLC = Pred->getLocationContext();
+      const StackFrameContext *CallerSFC = CurLC->getCurrentStackFrame();
+      const LocationContext *ParentOfCallee = CallerSFC;
+
+      if (Call.getKind() == CE_Block) {
+        const BlockDataRegion *BR = cast<BlockCall>(Call).getBlockRegion();
+        assert(BR &&
+               "If we have the block definition we should have its region");
+        AnalysisDeclContext *BlockCtx = AMgr.getAnalysisDeclContext(D);
+        ParentOfCallee = BlockCtx->getBlockInvocationContext(
+            CallerSFC, cast<BlockDecl>(D), BR);
+      }
+
+      // This may be NULL, but that's fine.
+      const Expr *CallE = Call.getOriginExpr();
+
+      // Construct a new stack frame for the callee.
+      AnalysisDeclContext *CalleeADC = AMgr.getAnalysisDeclContext(D);
+      const StackFrameContext *CalleeSFC = CalleeADC->getStackFrame(
+          ParentOfCallee, CallE, currBldrCtx->getBlock(), currStmtIdx);
+
+      CallFunction(*this, Call, Bldr, Pred, CalleeSFC, State, Summary);
+    } else
+      conservativeEvalCall(Call, Bldr, Pred, State);
+
+  } else {
+
+    const LocationContext *CurLC = Pred->getLocationContext();
+    const StackFrameContext *CallerSFC = CurLC->getCurrentStackFrame();
+    const LocationContext *ParentOfCallee = CallerSFC;
+    if (Call.getKind() == CE_Block) {
+      const BlockDataRegion *BR = cast<BlockCall>(Call).getBlockRegion();
+      assert(BR && "If we have the block definition we should have its region");
+      AnalysisDeclContext *BlockCtx = AMgr.getAnalysisDeclContext(D);
+      ParentOfCallee = BlockCtx->getBlockInvocationContext(
+          CallerSFC, cast<BlockDecl>(D), BR);
+    }
+
+    // This may be NULL, but that's fine.
+    const Expr *CallE = Call.getOriginExpr();
+
+    // Construct a new stack frame for the callee.
+    AnalysisDeclContext *CalleeADC = AMgr.getAnalysisDeclContext(D);
+    const StackFrameContext *CalleeSFC = CalleeADC->getStackFrame(
+        ParentOfCallee, CallE, currBldrCtx->getBlock(), currStmtIdx);
+
+    CallEnter Loc(CallE, CalleeSFC, CurLC);
+
+    // Construct a new state which contains the mapping from actual to
+    // formal arguments.
+    State = State->enterStackFrame(Call, CalleeSFC);
+
+    bool isNew;
+    if (ExplodedNode *N = G.getNode(Loc, State, false, &isNew)) {
+      N->addPredecessor(Pred, G);
+      if (isNew)
+        Engine.getWorkList()->enqueue(N);
+    }
+
+    // If we decided to inline the call, the successor has been manually
+    // added onto the work list so remove it from the node builder.
   }
-  
-  // This may be NULL, but that's fine.
-  const Expr *CallE = Call.getOriginExpr();
 
-  // Construct a new stack frame for the callee.
-  AnalysisDeclContext *CalleeADC = AMgr.getAnalysisDeclContext(D);
-  const StackFrameContext *CalleeSFC =
-    CalleeADC->getStackFrame(ParentOfCallee, CallE,
-                             currBldrCtx->getBlock(),
-                             currStmtIdx);
-  
-    
-  CallEnter Loc(CallE, CalleeSFC, CurLC);
-
-  // Construct a new state which contains the mapping from actual to
-  // formal arguments.
-  State = State->enterStackFrame(Call, CalleeSFC);
-
-  bool isNew;
-  if (ExplodedNode *N = G.getNode(Loc, State, false, &isNew)) {
-    N->addPredecessor(Pred, G);
-    if (isNew)
-      Engine.getWorkList()->enqueue(N);
-  }
-
-  // If we decided to inline the call, the successor has been manually
-  // added onto the work list so remove it from the node builder.
   Bldr.takeNodes(Pred);
-
   NumInlinedCalls++;
 
   // Mark the decl as visited.
   if (VisitedCallees)
-    VisitedCallees->insert(D);
+    VisitedCallees->insert(D->getCanonicalDecl());
 
   return true;
 }
@@ -564,8 +724,16 @@ ProgramStateRef ExprEngine::bindReturnValue(const CallEvent &Call,
   // Conjure a symbol if the return value is unknown.
   QualType ResultTy = Call.getResultType();
   SValBuilder &SVB = getSValBuilder();
-  unsigned Count = currBldrCtx->blockCount();
-  SVal R = SVB.conjureSymbolVal(0, E, LCtx, ResultTy, Count);
+  SVal R;
+  if (ResultTy->isRecordType()) { // Note that arrays cannot be returned.
+    MemRegionManager &MemMgr = State->getStateManager().getRegionManager();
+    StoreManager &StMgr = State->getStateManager().getStoreManager();
+    const CXXTempObjectRegion *MR = MemMgr.getCXXStaticTempObjectRegion(E);
+    R = SVB.makeLazyCompoundVal(StoreRef((Store) NULL, StMgr), MR);
+  } else {
+    unsigned Count = currBldrCtx->blockCount();
+    R = SVB.conjureSymbolVal(0, E, LCtx, ResultTy, Count);
+  }
   return State->BindExpr(E, LCtx, R);
 }
 
@@ -802,6 +970,8 @@ bool ExprEngine::shouldInlineCall(const CallEvent &Call, const Decl *D,
   if (!D)
     return false;
 
+  D = D->getCanonicalDecl();
+
   AnalysisManager &AMgr = getAnalysisManager();
   AnalyzerOptions &Opts = AMgr.options;
   AnalysisDeclContextManager &ADCMgr = AMgr.getAnalysisDeclContextManager();
@@ -856,29 +1026,36 @@ bool ExprEngine::shouldInlineCall(const CallEvent &Call, const Decl *D,
 
   const CFG *CalleeCFG = CalleeADC->getCFG();
 
-  // Do not inline if recursive or we've reached max stack frame count.
-  bool IsRecursive = false;
-  unsigned StackDepth = 0;
-  examineStackFrames(D, Pred->getLocationContext(), IsRecursive, StackDepth);
-  if ((StackDepth >= Opts.InlineMaxStackDepth) &&
-      ((CalleeCFG->getNumBlockIDs() > Opts.getAlwaysInlineSize())
-       || IsRecursive))
-    return false;
+  if (HowToInline == Inline_Summary) {
+    // Do not construct summaries recursively.
+    if (std::find(SCS.begin(), SCS.end(), D) != SCS.end())
+      return false;
 
-  // Do not inline large functions too many times.
-  if ((Engine.FunctionSummaries->getNumTimesInlined(D) >
-       Opts.getMaxTimesInlineLarge()) &&
-      CalleeCFG->getNumBlockIDs() > 13) {
-    NumReachedInlineCountMax++;
-    return false;
+    Engine.FunctionSummaries->bumpNumTimesInlined(D);
+
+  } else {
+    // Do not inline if recursive or we've reached max stack frame count.
+    bool IsRecursive = false;
+    unsigned StackDepth = 0;
+    examineStackFrames(D, Pred->getLocationContext(), IsRecursive, StackDepth);
+    if ((StackDepth >= Opts.InlineMaxStackDepth) &&
+        ((CalleeCFG->getNumBlockIDs() > Opts.getMaxTimesInlineLarge()) ||
+         IsRecursive))
+      return false;
+
+    // Do not inline large functions too many times.
+    if ((Engine.FunctionSummaries->getNumTimesInlined(D) >
+         Opts.getMaxTimesInlineLarge()) &&
+        CalleeCFG->getNumBlockIDs() > 13) {
+      NumReachedInlineCountMax++;
+      return false;
+    }
+
+    if (HowToInline == Inline_Minimal &&
+        (CalleeCFG->getNumBlockIDs() > Opts.getAlwaysInlineSize() ||
+         IsRecursive))
+      return false;
   }
-
-  if (HowToInline == Inline_Minimal &&
-      (CalleeCFG->getNumBlockIDs() > Opts.getAlwaysInlineSize()
-      || IsRecursive))
-    return false;
-
-  Engine.FunctionSummaries->bumpNumTimesInlined(D);
 
   return true;
 }
@@ -990,16 +1167,29 @@ void ExprEngine::BifurcateCall(const MemRegion *BifurReg,
 
 void ExprEngine::VisitReturnStmt(const ReturnStmt *RS, ExplodedNode *Pred,
                                  ExplodedNodeSet &Dst) {
-  
   ExplodedNodeSet dstPreVisit;
   getCheckerManager().runCheckersForPreStmt(dstPreVisit, Pred, RS, *this);
 
   StmtNodeBuilder B(dstPreVisit, Dst, *currBldrCtx);
-  
-  if (RS->getRetValue()) {
-    for (ExplodedNodeSet::iterator it = dstPreVisit.begin(),
-                                  ei = dstPreVisit.end(); it != ei; ++it) {
-      B.generateNode(RS, *it, (*it)->getState());
+
+  if (HowToInline == Inline_Summary) {
+    if (const Expr *E = RS->getRetValue()) {
+      for (ExplodedNodeSet::iterator it = dstPreVisit.begin(),
+                                     ei = dstPreVisit.end();
+           it != ei; ++it) {
+        ProgramStateRef state = (*it)->getState();
+        SVal SV = state->getSVal(E, (*it)->getLocationContext());
+        state = FunctionCallBranchSummary::saveReturnValue(state, SV);
+        B.generateNode(RS, *it, state);
+      }
+    }
+  } else {
+    if (RS->getRetValue()) {
+      for (ExplodedNodeSet::iterator it = dstPreVisit.begin(),
+                                     ei = dstPreVisit.end();
+           it != ei; ++it) {
+        B.generateNode(RS, *it, (*it)->getState());
+      }
     }
   }
 }

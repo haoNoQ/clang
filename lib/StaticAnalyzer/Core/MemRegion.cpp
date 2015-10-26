@@ -22,6 +22,7 @@
 #include "clang/Analysis/Support/BumpVector.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/SValBuilder.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace clang;
@@ -337,7 +338,8 @@ void SymbolicRegion::ProfileRegion(llvm::FoldingSetNodeID& ID, SymbolRef sym,
                                    const MemRegion *sreg) {
   ID.AddInteger((unsigned) MemRegion::SymbolicRegionKind);
   ID.Add(sym);
-  ID.AddPointer(sreg);
+  // Do not consider sreg. It may be either UnknownSpaceRegion or
+  // HeapSpaceRegion, yet this is completely determined by the symbol.
 }
 
 void SymbolicRegion::Profile(llvm::FoldingSetNodeID& ID) const {
@@ -508,7 +510,7 @@ void ObjCIvarRegion::dumpToStream(raw_ostream &os) const {
 }
 
 void StringRegion::dumpToStream(raw_ostream &os) const {
-  Str->printPretty(os, 0, PrintingPolicy(getContext().getLangOpts()));
+  Str->outputString(os);
 }
 
 void ObjCStringRegion::dumpToStream(raw_ostream &os) const {
@@ -1116,17 +1118,6 @@ const SymbolicRegion *MemRegion::getSymbolicBase() const {
   return 0;
 }
 
-// FIXME: Merge with the implementation of the same method in Store.cpp
-static bool IsCompleteType(ASTContext &Ctx, QualType Ty) {
-  if (const RecordType *RT = Ty->getAs<RecordType>()) {
-    const RecordDecl *D = RT->getDecl();
-    if (!D->getDefinition())
-      return false;
-  }
-
-  return true;
-}
-
 RegionRawOffset ElementRegion::getAsArrayOffset() const {
   CharUnits offset = CharUnits::Zero();
   const ElementRegion *ER = this;
@@ -1148,7 +1139,7 @@ RegionRawOffset ElementRegion::getAsArrayOffset() const {
         QualType elemType = ER->getElementType();
 
         // If we are pointing to an incomplete type, go no further.
-        if (!IsCompleteType(C, elemType)) {
+        if (elemType->isIncompleteType()) {
           superR = ER;
           break;
         }
@@ -1254,9 +1245,7 @@ RegionOffset MemRegion::getAsOffset() const {
       if (!Child) {
         // We cannot compute the offset of the base class.
         SymbolicOffsetBase = R;
-      }
-
-      if (RootIsSymbolic) {
+      } else if (RootIsSymbolic) {
         // Base layers on symbolic regions may not be type-correct.
         // Double-check the inheritance here, and revert to a symbolic offset
         // if it's invalid (e.g. due to a reinterpret_cast).
@@ -1290,7 +1279,7 @@ RegionOffset MemRegion::getAsOffset() const {
       R = ER->getSuperRegion();
 
       QualType EleTy = ER->getValueType();
-      if (!IsCompleteType(getContext(), EleTy)) {
+      if (EleTy->isIncompleteType()) {
         // We cannot compute the offset of the base class.
         SymbolicOffsetBase = R;
         continue;
@@ -1347,10 +1336,21 @@ RegionOffset MemRegion::getAsOffset() const {
     }
   }
 
- Finish:
+Finish:
   if (SymbolicOffsetBase)
     return RegionOffset(SymbolicOffsetBase, RegionOffset::Symbolic);
   return RegionOffset(R, Offset);
+}
+
+SVal MemRegion::getAddress(ProgramStateRef state) const {
+  SValBuilder &svalBuilder = state->getStateManager().getSValBuilder();
+  if (const SymbolicRegion *SR = dyn_cast<SymbolicRegion>(this)) {
+    // For symbolic regions return the base symbol.
+    return nonloc::SymbolVal(SR->getSymbol());
+  }
+  // Otherwise, give up.
+  return nonloc::SymbolVal(
+      svalBuilder.getSymbolManager().getRegionAddressSymbol(this));
 }
 
 //===----------------------------------------------------------------------===//

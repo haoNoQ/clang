@@ -36,6 +36,7 @@ class StackFrameContext;
 class BlockInvocationContext;
 class AnalysisDeclContextManager;
 class LocationContext;
+class ASTImporter;
 
 namespace idx { class TranslationUnit; }
 
@@ -59,6 +60,14 @@ public:
   // which creates the analysis object given an AnalysisDeclContext.
 };
 
+
+struct CallDeclPair {
+  CallDeclPair(const FunctionDecl *CalleeD, const FunctionDecl *TargetD):
+    CalleeDecl(CalleeD), TargetDecl(TargetD) {}
+  CallDeclPair() {}
+  const FunctionDecl *CalleeDecl;
+  const FunctionDecl *TargetDecl;
+};
 
 /// AnalysisDeclContext contains the context data for the function or method
 /// under analysis.

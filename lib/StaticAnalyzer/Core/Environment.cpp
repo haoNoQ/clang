@@ -85,6 +85,7 @@ SVal Environment::getSVal(const EnvironmentEntry &Entry,
   case Stmt::CXXScalarValueInitExprClass:
   case Stmt::ImplicitValueInitExprClass:
   case Stmt::IntegerLiteralClass:
+  case Stmt::FloatingLiteralClass:
   case Stmt::ObjCBoolLiteralExprClass:
   case Stmt::CXXNullPtrLiteralExprClass:
   case Stmt::ObjCStringLiteralClass:
@@ -108,13 +109,17 @@ SVal Environment::getSVal(const EnvironmentEntry &Entry,
 Environment EnvironmentManager::bindExpr(Environment Env,
                                          const EnvironmentEntry &E,
                                          SVal V,
-                                         bool Invalidate) {
+                                         bool Invalidate, SymbolManager &SM) {
   if (V.isUnknown()) {
     if (Invalidate)
       return Environment(F.remove(Env.ExprBindings, E));
     else
       return Env;
   }
+  if (SymbolRef VSym = V.getAsSymbol())
+    if (const SymbolCast *CastSym = dyn_cast<SymbolCast>(VSym))
+      SM.addCast(CastSym->getOperand(), CastSym);
+
   return Environment(F.add(Env.ExprBindings, E, V));
 }
 

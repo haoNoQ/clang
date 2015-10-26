@@ -14,6 +14,7 @@
 #ifndef LLVM_CLANG_GR_CONSTRAINT_MANAGER_H
 #define LLVM_CLANG_GR_CONSTRAINT_MANAGER_H
 
+#include "clang/StaticAnalyzer/Core/PathSensitive/Store.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/SVals.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/SymbolManager.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -26,6 +27,9 @@ namespace clang {
 namespace ento {
 
 class SubEngine;
+class NodeBuilder;
+class ExplodedNode;
+class CheckerManager;
 
 class ConditionTruthVal {
   Optional<bool> Val;
@@ -68,6 +72,11 @@ public:
                                  DefinedSVal Cond,
                                  bool Assumption) = 0;
 
+  virtual ProgramStateRef bindCastSVal(ProgramStateRef State,
+                                       const LocationContext *LCtx,
+                                       const Stmt *S, SVal &Val,
+                                       QualType castTy, QualType originalTy) =0;
+
   typedef std::pair<ProgramStateRef, ProgramStateRef> ProgramStatePair;
 
   /// Returns a pair of states (StTrue, StFalse) where the given condition is
@@ -99,18 +108,48 @@ public:
     return ProgramStatePair(StTrue, StFalse);
   }
 
+  virtual ProgramStateRef assumeBound(ProgramStateRef State, NonLoc Value,
+                                      const llvm::APSInt &From,
+                                      const llvm::APSInt &To,
+                                      bool InBound) = 0;
+
+  virtual ProgramStatePair assumeBoundDual(ProgramStateRef State, NonLoc Value,
+                                           const llvm::APSInt &From,
+                                           const llvm::APSInt &To) {
+    ProgramStateRef StInBound = assumeBound(State, Value, From, To, true);
+
+    // If StTrue is infeasible, asserting the falseness of Cond is unnecessary
+    // because the existing constraints already establish this.
+    if (!StInBound)
+      return ProgramStatePair((ProgramStateRef)NULL, State);
+
+    ProgramStateRef StOutOfBounds = assumeBound(State, Value, From, To, false);
+    if (!StOutOfBounds) {
+      // We are careful to return the original state, /not/ StTrue,
+      // because we want to avoid having callers generate a new node
+      // in the ExplodedGraph.
+      return ProgramStatePair(State, (ProgramStateRef)NULL);
+    }
+
+    return ProgramStatePair(StInBound, StOutOfBounds);
+  }
+
   /// \brief If a symbol is perfectly constrained to a constant, attempt
   /// to return the concrete value.
   ///
   /// Note that a ConstraintManager is not obligated to return a concretized
   /// value for a symbol, even if it is perfectly constrained.
-  virtual const llvm::APSInt* getSymVal(ProgramStateRef state,
+  virtual const APValue* getSymVal(ProgramStateRef state,
                                         SymbolRef sym) const {
     return 0;
   }
 
   virtual ProgramStateRef removeDeadBindings(ProgramStateRef state,
                                                  SymbolReaper& SymReaper) = 0;
+
+  virtual ProgramStateRef
+  applyCallBranchSummary(const FunctionCallBranchSummary &Summary,
+                         Summarizer &S) = 0;
 
   virtual void print(ProgramStateRef state,
                      raw_ostream &Out,
@@ -141,7 +180,7 @@ protected:
   ///  reasonably handle a given SVal value.  This is typically queried by
   ///  ExprEngine to determine if the value should be replaced with a
   ///  conjured symbolic value in order to recover some precision.
-  virtual bool canReasonAbout(SVal X) const = 0;
+  virtual bool canReasonAbout(ProgramStateRef state, SVal X) const = 0;
 
   /// Returns whether or not a symbol is known to be null ("true"), known to be
   /// non-null ("false"), or may be either ("underconstrained"). 

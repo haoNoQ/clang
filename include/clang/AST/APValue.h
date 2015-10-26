@@ -119,6 +119,7 @@ private:
   };
 
 public:
+  void Profile(llvm::FoldingSetNodeID &id) const;
   APValue() : Kind(Uninitialized) {}
   explicit APValue(const APSInt &I) : Kind(Uninitialized) {
     MakeInt(); setInt(I);
@@ -395,6 +396,49 @@ public:
     swap(RHS);
     return *this;
   }
+
+  APFloat::cmpResult compareFloat(const APValue &Rhs) const {
+    assert(this->isFloat() && Rhs.isFloat() && "Both values should be float");
+    return this->getFloat().compareWithConversion(Rhs.getFloat());
+  }
+
+  APFloat::cmpResult compareFloat(const APFloat &Rhs) const {
+    assert(this->isFloat() && "Object should be float");
+    return this->getFloat().compareWithConversion(Rhs);
+  }
+
+  APSInt::cmpResult compareInteger(const APValue &Rhs) const {
+    assert(this->isInt() && Rhs.isInt() && "Both values should be integer");
+    return this->getInt().compare(Rhs.getInt());
+  }
+
+  APSInt::cmpResult compareInteger(const APSInt &Rhs) const {
+    assert(this->isInt() && "Object should be integer");
+    return this->getInt().compare(Rhs);
+  }
+
+  APFloat::cmpResult compare(const APValue &Rhs) const {
+    if (Rhs.isFloat())
+      return compareFloat(Rhs);
+    return (APFloat::cmpResult)compareInteger(Rhs);
+  }
+
+  static const APValue& max(const APValue &Lhs, const APValue &Rhs) {
+    if (Lhs.isInt())
+      return Lhs.getInt().compare(Rhs.getInt()) == APSInt::cmpGreaterThan
+          ? Lhs : Rhs;
+    return Lhs.getFloat().compareWithConversion(Rhs.getFloat()) ==
+           APFloat::cmpGreaterThan ? Lhs : Rhs;
+  }
+
+  static const APValue& min(const APValue &Lhs, const APValue &Rhs) {
+    if (Lhs.isInt())
+      return Lhs.getInt().compare(Rhs.getInt()) == APSInt::cmpLessThan
+          ? Lhs : Rhs;
+    return Lhs.getFloat().compareWithConversion(Rhs.getFloat()) ==
+           APFloat::cmpLessThan ? Lhs : Rhs;
+  }
+
 
 private:
   void DestroyDataAndMakeUninit();

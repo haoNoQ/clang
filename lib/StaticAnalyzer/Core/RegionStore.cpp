@@ -21,6 +21,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/AnalysisManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/FunctionCallSummary.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
@@ -90,6 +91,7 @@ public:
   }
 
   static BindingKey Make(const MemRegion *R, Kind k);
+  static BindingKey MakeByOffset(const MemRegion *R, Kind k, uint64_t Offset);
 
   bool operator<(const BindingKey &X) const {
     if (P.getOpaqueValue() < X.P.getOpaqueValue())
@@ -114,6 +116,11 @@ BindingKey BindingKey::Make(const MemRegion *R, Kind k) {
     return BindingKey(cast<SubRegion>(R), cast<SubRegion>(RO.getRegion()), k);
 
   return BindingKey(RO.getRegion(), RO.getOffset(), k);
+}
+
+BindingKey BindingKey::MakeByOffset(const MemRegion *R, Kind k,
+                                    uint64_t Offset) {
+  return BindingKey(R, Offset, k);
 }
 
 namespace llvm {
@@ -181,6 +188,9 @@ public:
   RegionBindingsRef addBinding(const MemRegion *R,
                                BindingKey::Kind k, SVal V) const;
 
+  RegionBindingsRef addBindingByOffset(const MemRegion *R, BindingKey::Kind k,
+                                       SVal V, uint64_t Offset) const;
+
   RegionBindingsRef &operator=(const RegionBindingsRef &X) {
     *static_cast<ParentTy*>(this) = X;
     return *this;
@@ -218,7 +228,8 @@ public:
      const ClusterBindings &Cluster = I.getData();
      for (ClusterBindings::iterator CI = Cluster.begin(), CE = Cluster.end();
           CI != CE; ++CI) {
-       OS << ' ' << CI.getKey() << " : " << CI.getData() << nl;
+       OS << ' ' << CI.getKey() << " (" << (const void *)CI.getKey().getRegion()
+          << ") : " << CI.getData() << nl;
      }
      OS << nl;
    }
@@ -261,6 +272,13 @@ RegionBindingsRef RegionBindingsRef::addBinding(const MemRegion *R,
                                                 BindingKey::Kind k,
                                                 SVal V) const {
   return addBinding(BindingKey::Make(R, k), V);
+}
+
+RegionBindingsRef RegionBindingsRef::addBindingByOffset(const MemRegion *R,
+                                                        BindingKey::Kind k,
+                                                        SVal V,
+                                                        uint64_t Offset) const {
+  return addBinding(BindingKey::MakeByOffset(R, k, Offset), V);
 }
 
 const SVal *RegionBindingsRef::lookup(BindingKey K) const {
@@ -414,7 +432,17 @@ public: // Part of public interface to class.
     return StoreRef(bind(getRegionBindings(store), LV, V).asStore(), *this);
   }
 
+  virtual StoreRef BindByOffset(Store store, Loc LV, SVal V, uint64_t Offset,
+                                bool Direct = true) {
+    return StoreRef(
+        bindByOffset(getRegionBindings(store), LV, V, Offset, Direct).asStore(),
+        *this);
+  }
+
   RegionBindingsRef bind(RegionBindingsConstRef B, Loc LV, SVal V);
+
+  RegionBindingsRef bindByOffset(RegionBindingsConstRef B, Loc LV, SVal V,
+                                 uint64_t Offset, bool Direct = true);
 
   // BindDefault is only used to initialize a region with a default value.
   StoreRef BindDefault(Store store, const MemRegion *R, SVal V) {
@@ -486,6 +514,10 @@ public: // Part of public interface to class.
   
   bool includedInBindings(Store store, const MemRegion *region) const;
 
+  bool hasDirectBinding(Store store, const MemRegion *R) const {
+    return getRegionBindings(store).getDirectBinding(R).hasValue();
+  }
+
   /// \brief Return the value bound to specified location in a given state.
   ///
   /// The high level logic for this method is this:
@@ -502,6 +534,9 @@ public: // Part of public interface to class.
   virtual SVal getBinding(Store S, Loc L, QualType T) {
     return getBinding(getRegionBindings(S), L, T);
   }
+
+  StoreRef ActualizeStore(Summarizer &S, const void *Summary,
+                          const LocationContext *LCtx);
 
   SVal getBinding(RegionBindingsConstRef B, Loc L, QualType T = QualType());
 
@@ -564,8 +599,8 @@ public: // Part of public interface to class.
   /// removeDeadBindings - Scans the RegionStore of 'state' for dead values.
   ///  It returns a new Store with these values removed.
   StoreRef removeDeadBindings(Store store, const StackFrameContext *LCtx,
-                              SymbolReaper& SymReaper);
-  
+                              SymbolReaper &SymReaper);
+
   //===------------------------------------------------------------------===//
   // Region "extents".
   //===------------------------------------------------------------------===//
@@ -594,13 +629,12 @@ public: // Part of public interface to class.
       for (ClusterBindings::iterator CI = Cluster.begin(), CE = Cluster.end();
            CI != CE; ++CI) {
         const BindingKey &K = CI.getKey();
-        if (!K.isDirect())
+        if (K.hasSymbolicOffset())
           continue;
-        if (const SubRegion *R = dyn_cast<SubRegion>(K.getRegion())) {
-          // FIXME: Possibly incorporate the offset?
-          if (!f.HandleBinding(*this, store, R, CI.getData()))
-            return;
-        }
+        // FIXME: Handle symbolic offsets
+        if (!f.HandleBinding(*this, store, K.getRegion(), K.getOffset(),
+                             CI.getData(), K.isDirect()))
+          return;
       }
     }
   }
@@ -1212,7 +1246,7 @@ RegionStoreManager::getSizeInElements(ProgramStateRef state,
                                       const MemRegion *R,
                                       QualType EleTy) {
   SVal Size = cast<SubRegion>(R)->getExtent(svalBuilder);
-  const llvm::APSInt *SizeInt = svalBuilder.getKnownValue(state, Size);
+  const llvm::APSInt *SizeInt = svalBuilder.getKnownIntValue(state, Size);
   if (!SizeInt)
     return UnknownVal();
 
@@ -1285,6 +1319,8 @@ SVal RegionStoreManager::getBinding(RegionBindingsConstRef B, Loc L, QualType T)
         const SymbolicRegion *SR = cast<SymbolicRegion>(MR);
         T = SR->getSymbol()->getType();
       }
+      if (T->isAnyPointerType() || T->isReferenceType())
+        T = T->getPointeeType();
     }
     MR = GetElementZeroRegion(MR, T);
   }
@@ -1819,9 +1855,9 @@ RegionStoreManager::getInterestingValues(nonloc::LazyCompoundVal LCV) {
 NonLoc RegionStoreManager::createLazyBinding(RegionBindingsConstRef B,
                                              const TypedValueRegion *R) {
   if (Optional<nonloc::LazyCompoundVal> V =
-        getExistingLazyBinding(svalBuilder, B, R, false))
+        getExistingLazyBinding(svalBuilder, B, R, false)) {
     return *V;
-
+  }
   return svalBuilder.makeLazyCompoundVal(StoreRef(B.asStore(), *this), R);
 }
 
@@ -1925,6 +1961,17 @@ RegionStoreManager::bind(RegionBindingsConstRef B, Loc L, SVal V) {
   return NewB.addBinding(BindingKey::Make(R, BindingKey::Direct), V);
 }
 
+RegionBindingsRef RegionStoreManager::bindByOffset(RegionBindingsConstRef B,
+                                                   Loc L, SVal V,
+                                                   uint64_t Offset,
+                                                   bool Direct) {
+  return B.addBinding(BindingKey::MakeByOffset(L.getAsRegion(),
+                                               Direct ? BindingKey::Direct
+                                                      : BindingKey::Default,
+                                               Offset),
+                      V);
+}
+
 RegionBindingsRef
 RegionStoreManager::setImplicitDefaultValue(RegionBindingsConstRef B,
                                             const MemRegion *R,
@@ -1933,7 +1980,7 @@ RegionStoreManager::setImplicitDefaultValue(RegionBindingsConstRef B,
 
   if (Loc::isLocType(T))
     V = svalBuilder.makeNull();
-  else if (T->isIntegralOrEnumerationType())
+  else if (T->isIntegralOrEnumerationType() || T->isRealFloatingType())
     V = svalBuilder.makeZeroVal(T);
   else if (T->isStructureOrClassType() || T->isArrayType()) {
     // Set the default value to a zero constant when it is a structure
@@ -2361,3 +2408,4 @@ void RegionStoreManager::print(Store store, raw_ostream &OS,
      << " :" << nl;
   B.dump(OS, nl);
 }
+

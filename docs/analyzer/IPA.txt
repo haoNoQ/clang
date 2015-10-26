@@ -27,6 +27,14 @@ inlining. The major one is -analyzer-config ipa:
    other. This mode does not drop the coverage in cases when the parent class 
    has code that is only exercised when some of its methods are overridden.
 
+  -analyzer-config ipa=summary - Instead of inlining, construct a summary
+   of the function's behavior (the way call affects the program state),
+   and then apply this summary every time the function is encountered
+   during analysis. This should be faster because summaries are
+   more lightweight than complete exploded graphs, and also because
+   second-level calls become part of the summary and are no longer
+   re-applied; quality of the analysis may suffer though.
+
 Currently, -analyzer-config ipa=dynamic-bifurcate is the default mode.
 
 While -analyzer-config ipa determines in general how aggressively the analyzer 

@@ -26,9 +26,9 @@ protected:
   virtual SVal evalCastFromLoc(Loc val, QualType castTy);
 
 public:
-  SimpleSValBuilder(llvm::BumpPtrAllocator &alloc, ASTContext &context,
-                    ProgramStateManager &stateMgr)
-                    : SValBuilder(alloc, context, stateMgr) {}
+  SimpleSValBuilder(BasicValueFactory &BVF,
+                    ASTContext &context, ProgramStateManager &stateMgr)
+                    : SValBuilder(BVF, context, stateMgr) {}
   virtual ~SimpleSValBuilder() {}
 
   virtual SVal evalMinus(NonLoc val);
@@ -42,17 +42,20 @@ public:
 
   /// getKnownValue - evaluates a given SVal. If the SVal has only one possible
   ///  (integer) value, that value is returned. Otherwise, returns NULL.
-  virtual const llvm::APSInt *getKnownValue(ProgramStateRef state, SVal V);
+  virtual const llvm::APSInt *getKnownIntValue(ProgramStateRef state, SVal V);
+  virtual const llvm::APFloat *getKnownFloatValue(ProgramStateRef state, SVal V);
   
   SVal MakeSymIntVal(const SymExpr *LHS, BinaryOperator::Opcode op,
                      const llvm::APSInt &RHS, QualType resultTy);
+  SVal MakeSymFloatVal(const SymExpr *LHS, BinaryOperator::Opcode op,
+                     const llvm::APFloat &RHS, QualType resultTy);
 };
 } // end anonymous namespace
 
-SValBuilder *ento::createSimpleSValBuilder(llvm::BumpPtrAllocator &alloc,
+SValBuilder *ento::createSimpleSValBuilder(BasicValueFactory &BVF,
                                            ASTContext &context,
                                            ProgramStateManager &stateMgr) {
-  return new SimpleSValBuilder(alloc, context, stateMgr);
+  return new SimpleSValBuilder(BVF, context, stateMgr);
 }
 
 //===----------------------------------------------------------------------===//
@@ -77,7 +80,8 @@ SVal SimpleSValBuilder::evalCastFromNonLoc(NonLoc val, QualType castTy) {
     unsigned castSize = Context.getTypeSize(castTy);
     if (castSize == LI->getNumBits())
       return val;
-    return makeLocAsInteger(LI->getLoc(), castSize);
+    return makeLocAsInteger(LI->getLoc(), castSize,
+                            castTy->isSignedIntegerOrEnumerationType());
   }
 
   if (const SymExpr *se = val.getAsSymbolicExpression()) {
@@ -92,13 +96,14 @@ SVal SimpleSValBuilder::evalCastFromNonLoc(NonLoc val, QualType castTy) {
    if (haveSameType(T, castTy))
       return val;
 
+
     if (!isLocType)
       return makeNonLoc(se, T, castTy);
     return UnknownVal();
   }
 
-  // If value is a non integer constant, produce unknown.
-  if (!val.getAs<nonloc::ConcreteInt>())
+  // If value is a non integer and a non float constant, produce unknown.
+  if (!val.getAs<nonloc::ConcreteInt>() && !val.getAs<nonloc::ConcreteFloat>())
     return UnknownVal();
 
   // Handle casts to a boolean type.
@@ -107,18 +112,47 @@ SVal SimpleSValBuilder::evalCastFromNonLoc(NonLoc val, QualType castTy) {
     return makeTruthVal(b, castTy);
   }
 
-  // Only handle casts from integers to integers - if val is an integer constant
-  // being cast to a non integer type, produce unknown.
-  if (!isLocType && !castTy->isIntegralOrEnumerationType())
+  // Only handle casts from integers to integers(and floats ^.^) - if val is an
+  // integer constant being cast to a non integer type(and non float >.>),
+  // produce unknown.
+  if (!isLocType && !(castTy->isIntegralOrEnumerationType() ||
+                      castTy->isRealFloatingType()))
     return UnknownVal();
 
-  llvm::APSInt i = val.castAs<nonloc::ConcreteInt>().getValue();
-  BasicVals.getAPSIntType(castTy).apply(i);
-
-  if (isLocType)
-    return makeIntLocVal(i);
-  else
-    return makeIntVal(i);
+  if (val.getAs<nonloc::ConcreteInt>()) {
+    llvm::APSInt i = val.castAs<nonloc::ConcreteInt>().getValue();
+    if (castTy->isRealFloatingType()) {
+      llvm::APFloat f(i.roundToDouble(i.isSigned()));
+      bool losesInfo;
+      f.convert(Context.getFloatTypeSemantics(castTy),
+                llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+      assert(!isLocType && "Cannot make floating-point Loc!");
+      return makeFloatVal(f);
+    }
+    BasicVals.getAPSIntType(castTy).apply(i);
+    if (isLocType)
+      return makeIntLocVal(i);
+    else
+      return makeIntVal(i);
+  } else {
+    llvm::APFloat fval = val.castAs<nonloc::ConcreteFloat>().getValue();
+    if (castTy->isRealFloatingType()) {
+      llvm::APFloat f(fval);
+//      bool losesInfo;
+//      f.convert(Context.getFloatTypeSemantics(castTy),
+//          llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+      assert(!isLocType && "Cannot make floating-point Loc!");
+      return makeFloatVal(f);
+    }
+    llvm::APSInt i;
+    bool isExact;
+    fval.convertToInteger(i, llvm::APFloat::rmNearestTiesToAway, &isExact);
+    BasicVals.getAPSIntType(castTy).apply(i);
+    if (isLocType)
+      return makeIntLocVal(i);
+    else
+      return makeIntVal(i);
+  }
 }
 
 SVal SimpleSValBuilder::evalCastFromLoc(Loc val, QualType castTy) {
@@ -167,12 +201,14 @@ SVal SimpleSValBuilder::evalCastFromLoc(Loc val, QualType castTy) {
     unsigned BitWidth = Context.getTypeSize(castTy);
 
     if (!val.getAs<loc::ConcreteInt>())
-      return makeLocAsInteger(val, BitWidth);
+      return makeLocAsInteger(val, BitWidth,
+                              castTy->isSignedIntegerOrEnumerationType());
 
     llvm::APSInt i = val.castAs<loc::ConcreteInt>().getValue();
     BasicVals.getAPSIntType(castTy).apply(i);
     return makeIntVal(i);
   }
+
 
   // All other cases: return 'UnknownVal'.  This includes casting pointers
   // to floats, which is probably badness it itself, but this is a good
@@ -188,6 +224,8 @@ SVal SimpleSValBuilder::evalMinus(NonLoc val) {
   switch (val.getSubKind()) {
   case nonloc::ConcreteIntKind:
     return val.castAs<nonloc::ConcreteInt>().evalMinus(*this);
+  case nonloc::ConcreteFloatKind:
+    return val.castAs<nonloc::ConcreteFloat>().evalMinus(*this);
   default:
     return UnknownVal();
   }
@@ -261,7 +299,7 @@ SVal SimpleSValBuilder::MakeSymIntVal(const SymExpr *LHS,
     if (RHS == 0)
       isIdempotent = true;
     else if (RHS.isAllOnesValue()) {
-      const llvm::APSInt &Result = BasicVals.Convert(resultTy, RHS);
+      const llvm::APSInt &Result = BasicVals.Convert(resultTy, RHS).getInt();
       return nonloc::ConcreteInt(Result);
     }
     break;
@@ -273,6 +311,14 @@ SVal SimpleSValBuilder::MakeSymIntVal(const SymExpr *LHS,
   if (isIdempotent)
       return evalCastFromNonLoc(nonloc::SymbolVal(LHS), resultTy);
 
+  if (LHS->getType()->isRealFloatingType()) {
+    const llvm::APFloat *ConvertedRHS;
+    if (BinaryOperator::isComparisonOp(op))
+      ConvertedRHS = &BasicVals.Convert(LHS->getType(), RHS).getFloat();
+    else
+      ConvertedRHS = &BasicVals.Convert(resultTy, RHS).getFloat();
+    return makeNonLoc(LHS, op, *ConvertedRHS, resultTy);
+  }
   // If we reach this point, the expression cannot be simplified.
   // Make a SymbolVal for the entire expression, after converting the RHS.
   const llvm::APSInt *ConvertedRHS = &RHS;
@@ -287,19 +333,29 @@ SVal SimpleSValBuilder::MakeSymIntVal(const SymExpr *LHS,
 
     if (ValWidth < TypeWidth) {
       // If the value is too small, extend it.
-      ConvertedRHS = &BasicVals.Convert(SymbolType, RHS);
+      ConvertedRHS = &BasicVals.Convert(SymbolType, RHS).getInt();
     } else if (ValWidth == TypeWidth) {
       // If the value is signed but the symbol is unsigned, do the comparison
       // in unsigned space. [C99 6.3.1.8]
       // (For the opposite case, the value is already unsigned.)
       if (RHS.isSigned() && !SymbolType->isSignedIntegerOrEnumerationType())
-        ConvertedRHS = &BasicVals.Convert(SymbolType, RHS);
+        ConvertedRHS = &BasicVals.Convert(SymbolType, RHS).getInt();
     }
   } else
-    ConvertedRHS = &BasicVals.Convert(resultTy, RHS);
+    ConvertedRHS = &BasicVals.Convert(resultTy, RHS).getInt();
 
   return makeNonLoc(LHS, op, *ConvertedRHS, resultTy);
 }
+
+SVal SimpleSValBuilder::MakeSymFloatVal(const SymExpr *LHS,
+                                    BinaryOperator::Opcode op,
+                                    const llvm::APFloat &RHS,
+                                    QualType resultTy) {
+  // FIXME: Check for special cases with known reductions
+  const llvm::APFloat *NewRHS = &BasicVals.getValue(RHS).getFloat();
+  return makeNonLoc(LHS, op, *NewRHS, resultTy);
+}
+
 
 SVal SimpleSValBuilder::evalBinOpNN(ProgramStateRef state,
                                   BinaryOperator::Opcode op,
@@ -323,8 +379,13 @@ SVal SimpleSValBuilder::evalBinOpNN(ProgramStateRef state,
         return makeTruthVal(false, resultTy);
       case BO_Xor:
       case BO_Sub:
+        if (resultTy->isRealFloatingType()) {
+          llvm::APFloat val(0.0);
+          return makeFloatVal(val);
+        }
         if (resultTy->isIntegralOrEnumerationType())
           return makeIntVal(0, resultTy);
+
         return evalCastFromNonLoc(makeIntVal(0, /*Unsigned=*/false), resultTy);
       case BO_Or:
       case BO_And:
@@ -364,7 +425,7 @@ SVal SimpleSValBuilder::evalBinOpNN(ProgramStateRef state,
       llvm::APSInt LHSValue = lhs.castAs<nonloc::ConcreteInt>().getValue();
 
       // If we're dealing with two known constants, just perform the operation.
-      if (const llvm::APSInt *KnownRHSValue = getKnownValue(state, rhs)) {
+      if (const llvm::APSInt *KnownRHSValue = getKnownIntValue(state, rhs)) {
         llvm::APSInt RHSValue = *KnownRHSValue;
         if (BinaryOperator::isComparisonOp(op)) {
           // We're looking for a type big enough to compare the two values.
@@ -380,12 +441,11 @@ SVal SimpleSValBuilder::evalBinOpNN(ProgramStateRef state,
           IntType.apply(RHSValue);
         }
 
-        const llvm::APSInt *Result =
-          BasicVals.evalAPSInt(op, LHSValue, RHSValue);
-        if (!Result)
+        const APValue *Result = BasicVals.evalAPSInt(op, LHSValue, RHSValue);
+        if (!Result || !Result->isInt())
           return UndefinedVal();
 
-        return nonloc::ConcreteInt(*Result);
+        return nonloc::ConcreteInt(Result->getInt());
       }
 
       // Swap the left and right sides and flip the operator if doing so
@@ -422,9 +482,85 @@ SVal SimpleSValBuilder::evalBinOpNN(ProgramStateRef state,
         return makeSymExprValNN(state, op, InputLHS, InputRHS, resultTy);
       }
     }
+    case nonloc::ConcreteFloatKind: {
+      //lhs.dump();
+      llvm::APFloat LHSValue = lhs.castAs<nonloc::ConcreteFloat>().getValue();
+      //rhs.dump();
+      // If we're dealing with two known constants, just perform the operation.
+      if (const llvm::APFloat *KnownRHSValue = getKnownFloatValue(state, rhs)) {
+
+        llvm::APFloat RHSValue(*KnownRHSValue);
+        const APValue *Result =
+            BasicVals.evalAPFloat(op, LHSValue, RHSValue);
+        if (!Result)
+          return UndefinedVal();
+        if (Result->isFloat())
+          return nonloc::ConcreteFloat(Result->getFloat());
+        else if (Result->isInt())
+          return nonloc::ConcreteInt(Result->getInt());
+        else
+          llvm_unreachable("Unknown type");
+      } else if (const llvm::APSInt *KnownRHSValue =
+                 getKnownIntValue(state, rhs)) {
+        llvm_unreachable("Binary operator with APFloat and APSint");
+      }
+
+      // Swap the left and right sides and flip the operator if doing so
+      // allows us to better reason about the expression (this is a form
+      // of expression canonicalization).
+      // While we're at it, catch some special cases for non-commutative ops.
+      switch (op) {
+      case BO_LT:
+      case BO_GT:
+      case BO_LE:
+      case BO_GE:
+        op = BinaryOperator::reverseComparisonOp(op);
+        // FALL-THROUGH
+      case BO_EQ:
+      case BO_NE:
+      case BO_Add:
+      case BO_Mul:
+      case BO_And:
+      case BO_Xor:
+      case BO_Or:
+        std::swap(lhs, rhs);
+        continue;
+      default:
+        return makeSymExprValNN(state, op, InputLHS, InputRHS, resultTy);
+      }
+    }
     case nonloc::SymbolValKind: {
       // We only handle LHS as simple symbols or SymIntExprs.
       SymbolRef Sym = lhs.castAs<nonloc::SymbolVal>().getSymbol();
+
+      // SymbolRegionAddress is most likely non-zero.
+      if (const SymbolRegionAddress *symRegAddr =
+              dyn_cast<SymbolRegionAddress>(Sym)) {
+        if (rhs.isZeroConstant()) {
+          const MemRegion *region = symRegAddr->getRegion();
+          bool canBeNull = true;
+          if (region->getSymbolicBase()) {
+            RegionOffset RO = region->getAsOffset();
+            if (!RO.hasSymbolicOffset() && RO.getOffset() > 0)
+              canBeNull = false;
+          } else
+            canBeNull = false;
+          if (!canBeNull) {
+            switch(op) {
+              case BO_LT:
+              case BO_LE:
+              case BO_EQ:
+                return makeTruthVal(false, resultTy);
+              case BO_GT:
+              case BO_GE:
+              case BO_NE:
+                return makeTruthVal(true, resultTy);
+              default:
+                break;
+            }
+          }
+        }
+      }
 
       // LHS is a symbolic expression.
       if (const SymIntExpr *symIntExpr = dyn_cast<SymIntExpr>(Sym)) {
@@ -476,8 +612,9 @@ SVal SimpleSValBuilder::evalBinOpNN(ProgramStateRef state,
           }
         }
 
+
         // For now, only handle expressions whose RHS is a constant.
-        if (const llvm::APSInt *RHSValue = getKnownValue(state, rhs)) {
+        if (const llvm::APSInt *RHSValue = getKnownIntValue(state, rhs)) {
           // If both the LHS and the current expression are additive,
           // fold their constants and try again.
           if (BinaryOperator::isAdditiveOp(op)) {
@@ -496,9 +633,9 @@ SVal SimpleSValBuilder::evalBinOpNN(ProgramStateRef state,
 
               const llvm::APSInt *newRHS;
               if (lop == op)
-                newRHS = BasicVals.evalAPSInt(BO_Add, first, second);
+                newRHS = &BasicVals.evalAPSInt(BO_Add, first, second)->getInt();
               else
-                newRHS = BasicVals.evalAPSInt(BO_Sub, first, second);
+                newRHS = &BasicVals.evalAPSInt(BO_Sub, first, second)->getInt();
 
               assert(newRHS && "Invalid operation despite common type!");
               rhs = nonloc::ConcreteInt(*newRHS);
@@ -512,19 +649,112 @@ SVal SimpleSValBuilder::evalBinOpNN(ProgramStateRef state,
           return MakeSymIntVal(symIntExpr, op, *RHSValue, resultTy);
         }
       }
+      if (const SymFloatExpr *symFloatExpr = dyn_cast<SymFloatExpr>(Sym)) {
 
+        // Is this a logical not? (!x is represented as x == 0.)
+        if (op == BO_EQ && rhs.isZeroConstant()) {
+          // We know how to negate certain expressions. Simplify them here.
+
+          BinaryOperator::Opcode opc = symFloatExpr->getOpcode();
+          switch (opc) {
+          default:
+            // We don't know how to negate this operation.
+            // Just handle it as if it were a normal comparison to 0.
+            break;
+          case BO_LAnd:
+          case BO_LOr:
+            llvm_unreachable("Logical operators handled by branching logic.");
+          case BO_Assign:
+          case BO_MulAssign:
+          case BO_DivAssign:
+          case BO_RemAssign:
+          case BO_AddAssign:
+          case BO_SubAssign:
+          case BO_ShlAssign:
+          case BO_ShrAssign:
+          case BO_AndAssign:
+          case BO_XorAssign:
+          case BO_OrAssign:
+          case BO_Comma:
+            llvm_unreachable("'=' and ',' operators handled by ExprEngine.");
+          case BO_PtrMemD:
+          case BO_PtrMemI:
+            llvm_unreachable("Pointer arithmetic not handled here.");
+          case BO_LT:
+          case BO_GT:
+          case BO_LE:
+          case BO_GE:
+          case BO_EQ:
+          case BO_NE:
+            assert(resultTy->isBooleanType() ||
+                resultTy == getConditionType());
+            assert(symFloatExpr->getType()->isBooleanType() ||
+                getContext().hasSameUnqualifiedType(symFloatExpr->getType(),
+                    getConditionType()));
+            // Negate the comparison and make a value.
+            opc = BinaryOperator::negateComparisonOp(opc);
+            return makeNonLoc(symFloatExpr->getLHS(), opc,
+                symFloatExpr->getRHS(), resultTy);
+          }
+        }
+
+
+        // For now, only handle expressions whose RHS is a constant.
+        if (const llvm::APFloat *RHSValue = getKnownFloatValue(state, rhs)) {
+          if (BinaryOperator::isAdditiveOp(op)) {
+            BinaryOperator::Opcode lop = symFloatExpr->getOpcode();
+            if (BinaryOperator::isAdditiveOp(lop)) {
+
+              llvm::APFloat first(symFloatExpr->getRHS());
+//              bool losesInfo;
+              llvm::APFloat second(*RHSValue);
+//              first.convert(llvm::APFloat::IEEEdouble,
+//                            llvm::APFloat::rmNearestTiesToEven,
+//                            &losesInfo);
+//
+//              second.convert(llvm::APFloat::IEEEdouble,
+//                            llvm::APFloat::rmNearestTiesToEven,
+//                            &losesInfo);
+              const llvm::APFloat *newRHS;
+              if (lop == op)
+                newRHS = &BasicVals.evalAPFloat(BO_Add, first, second)->getFloat();
+              else
+                newRHS = &BasicVals.evalAPFloat(BO_Sub, first, second)->getFloat();
+
+              assert(newRHS && "Invalid operation despite common type!");
+              rhs = nonloc::ConcreteFloat(*newRHS);
+              lhs = nonloc::SymbolVal(symFloatExpr->getLHS());
+              op = lop;
+              continue;
+            }
+          }
+
+          // Otherwise, make a SymIntExpr out of the expression.
+          return MakeSymFloatVal(symFloatExpr, op, *RHSValue, resultTy);
+        }
+      }
       // Does the symbolic expression simplify to a constant?
       // If so, "fold" the constant by setting 'lhs' to a ConcreteInt
       // and try again.
       ConstraintManager &CMgr = state->getConstraintManager();
-      if (const llvm::APSInt *Constant = CMgr.getSymVal(state, Sym)) {
-        lhs = nonloc::ConcreteInt(*Constant);
+      const APValue *Constant = CMgr.getSymVal(state, Sym);
+      if (Constant && Constant->isInt()) {
+        lhs = nonloc::ConcreteInt(Constant->getInt());
+        continue;
+      }
+      if (Constant && Constant->isFloat()) {
+        lhs = nonloc::ConcreteFloat(Constant->getFloat());
         continue;
       }
 
+
       // Is the RHS a constant?
-      if (const llvm::APSInt *RHSValue = getKnownValue(state, rhs))
+      if (const llvm::APSInt *RHSValue = getKnownIntValue(state, rhs))
         return MakeSymIntVal(Sym, op, *RHSValue, resultTy);
+
+      if (const llvm::APFloat *RHSValue = getKnownFloatValue(state, rhs))
+            return MakeSymFloatVal(Sym, op, *RHSValue, resultTy);
+
 
       // Give up -- this is not a symbolic expression we can handle.
       return makeSymExprValNN(state, op, InputLHS, InputRHS, resultTy);
@@ -893,7 +1123,7 @@ SVal SimpleSValBuilder::evalBinOpLN(ProgramStateRef state,
         default:
           llvm_unreachable("Invalid pointer arithmetic operation");
       }
-      return loc::ConcreteInt(getBasicValueFactory().getValue(rightI));
+      return loc::ConcreteInt(getBasicValueFactory().getValue(rightI).getInt());
     }
   }
 
@@ -918,6 +1148,9 @@ SVal SimpleSValBuilder::evalBinOpLN(ProgramStateRef state,
         elementType = resultTy->getPointeeType();
     }
 
+    if (elementType.isNull())
+      return UnknownVal();
+
     if (Optional<NonLoc> indexV = index.getAs<NonLoc>()) {
       return loc::MemRegionVal(MemMgr.getElementRegion(elementType, *indexV,
                                                        superR, getContext()));
@@ -926,7 +1159,7 @@ SVal SimpleSValBuilder::evalBinOpLN(ProgramStateRef state,
   return UnknownVal();  
 }
 
-const llvm::APSInt *SimpleSValBuilder::getKnownValue(ProgramStateRef state,
+const llvm::APSInt *SimpleSValBuilder::getKnownIntValue(ProgramStateRef state,
                                                    SVal V) {
   if (V.isUnknownOrUndef())
     return NULL;
@@ -937,9 +1170,31 @@ const llvm::APSInt *SimpleSValBuilder::getKnownValue(ProgramStateRef state,
   if (Optional<nonloc::ConcreteInt> X = V.getAs<nonloc::ConcreteInt>())
     return &X->getValue();
 
-  if (SymbolRef Sym = V.getAsSymbol())
-    return state->getConstraintManager().getSymVal(state, Sym);
+  if (SymbolRef Sym = V.getAsSymbol()) {
+    const APValue *Val = state->getConstraintManager().getSymVal(state, Sym);
+    if (Val && Val->isInt())
+      return &(Val->getInt());
+  }
 
   // FIXME: Add support for SymExprs.
   return NULL;
 }
+
+const llvm::APFloat *SimpleSValBuilder::getKnownFloatValue(ProgramStateRef state,
+                                                   SVal V) {
+  if (V.isUnknownOrUndef())
+    return NULL;
+
+  if (Optional<nonloc::ConcreteFloat> X = V.getAs<nonloc::ConcreteFloat>())
+    return &X->getValue();
+
+  if (SymbolRef Sym = V.getAsSymbol()) {
+    const APValue *Val = state->getConstraintManager().getSymVal(state, Sym);
+    if (Val && Val->isFloat())
+      return &(Val->getFloat());
+  }
+
+  // FIXME: Add support for SymExprs.
+  return NULL;
+}
+

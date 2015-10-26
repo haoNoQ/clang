@@ -23,6 +23,7 @@
 
 namespace clang {
   class ASTContext;
+  class CXXBaseSpecifier;
   class Decl;
   class DeclContext;
   class DiagnosticsEngine;
@@ -32,16 +33,21 @@ namespace clang {
   class NestedNameSpecifier;
   class Stmt;
   class TypeSourceInfo;
+  class Sema;
   
   /// \brief Imports selected nodes from one AST context into another context,
   /// merging AST nodes where appropriate.
   class ASTImporter {
   public:
     typedef llvm::DenseSet<std::pair<Decl *, Decl *> > NonEquivalentDeclSet;
-    
+    typedef llvm::DenseMap<const CXXBaseSpecifier *, CXXBaseSpecifier *>
+    ImportedCXXBaseSpecifierMap;
   private:
     /// \brief The contexts we're importing to and from.
     ASTContext &ToContext, &FromContext;
+
+    /// \brief Sema we're importing from.
+    Sema *FromSema, *ToSema;
     
     /// \brief The file managers we're importing to and from.
     FileManager &ToFileManager, &FromFileManager;
@@ -67,6 +73,11 @@ namespace clang {
     /// \brief Mapping from the already-imported FileIDs in the "from" source
     /// manager to the corresponding FileIDs in the "to" source manager.
     llvm::DenseMap<FileID, FileID> ImportedFileIDs;
+
+    /// \brief Mapping from the already-imported CXXBasesSpecifier in
+    ///  the "from" source manager to the corresponding CXXBasesSpecifier
+    ///  in the "to" source manager.
+    ImportedCXXBaseSpecifierMap ImportedCXXBaseSpecifiers;
     
     /// \brief Imported, anonymous tag declarations that are missing their 
     /// corresponding typedefs.
@@ -120,6 +131,13 @@ namespace clang {
     /// \returns the equivalent declaration in the "to" context, or a NULL type 
     /// if an error occurred.
     Decl *Import(Decl *FromD);
+
+    /// \brief Get an imported declaration in "to" context
+    /// if it is already been imported
+    ///
+    /// \ returns an imported declaration if it is already imported,
+    ///  or a NULL type if is not imported yet.
+    Decl *GetImported(Decl *FromD);
 
     /// \brief Import the given declaration context from the "from"
     /// AST context into the "to" AST context.
@@ -199,6 +217,13 @@ namespace clang {
     /// \returns the equivalent file ID in the source manager of the "to"
     /// context.
     FileID Import(FileID);
+
+    /// \brief Import the given CXXBaseSpecifier from the "from" context into
+    /// the "to" context.
+    ///
+    /// \returns the equivalent CXXBaseSpecifier in the source manager of the
+    /// "to" context.
+    CXXBaseSpecifier *Import(const CXXBaseSpecifier *FromSpec);
     
     /// \brief Import the definition of the given declaration, including all of
     /// the declarations it contains.
@@ -243,7 +268,13 @@ namespace clang {
     
     /// \brief Retrieve the context that AST nodes are being imported from.
     ASTContext &getFromContext() const { return FromContext; }
-    
+
+    Sema *getFromSema() { return FromSema; }
+    void setFromSema(Sema *Sem) { FromSema = Sem; }
+
+    Sema *getToSema() { return ToSema; }
+    void setToSema(Sema *Sem) { ToSema = Sem; }
+
     /// \brief Retrieve the file manager that AST nodes are being imported into.
     FileManager &getToFileManager() const { return ToFileManager; }
 
@@ -279,11 +310,16 @@ namespace clang {
     /// RecordDecl can be found, we can complete it without the need for
     /// importation, eliminating this loop.
     virtual Decl *GetOriginalDecl(Decl *To) { return NULL; }
+
+    /// \brief Import getPreviousDecl() for declarations that can be redeclared.
+    /// Also imports all redeclaration chain.
+    void ImportRedeclarations(Decl *From, Decl *To);
     
     /// \brief Determine whether the given types are structurally
     /// equivalent.
     bool IsStructurallyEquivalent(QualType From, QualType To,
-                                  bool Complain = true);
+                                  bool Complain = true,
+                                  bool CheckQualifiers = true);
   };
 }
 

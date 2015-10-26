@@ -253,9 +253,6 @@ public:
                  const NamedDecl *D = 0)
     : Context(C), Out(Out_), Structor(getStructor(D)), StructorType(0),
       SeqID(0) {
-    // These can't be mangled without a ctor type or dtor type.
-    assert(!D || (!isa<CXXDestructorDecl>(D) &&
-                  !isa<CXXConstructorDecl>(D)));
   }
   CXXNameMangler(ItaniumMangleContextImpl &C, raw_ostream &Out_,
                  const CXXConstructorDecl *D, CXXCtorType Type)
@@ -451,7 +448,9 @@ void CXXNameMangler::mangleFunctionEncoding(const FunctionDecl *FD) {
   mangleName(FD);
 
   // Don't mangle in the type if this isn't a decl we should typically mangle.
-  if (!Context.shouldMangleDeclName(FD))
+  if (!Context.shouldMangleDeclName(FD) &&
+      !(Context.shouldForceMangleProto() &&
+        FD->getType()->getAs<FunctionProtoType>()))
     return;
 
   // Whether the mangling of a function type includes the return type depends on
@@ -1998,7 +1997,9 @@ void CXXNameMangler::mangleType(const FunctionProtoType *T) {
   Out << 'E';
 }
 void CXXNameMangler::mangleType(const FunctionNoProtoType *T) {
-  llvm_unreachable("Can't mangle K&R function prototypes");
+  assert(Context.shouldForceMangleProto() &&
+         "Can't mangle K&R function prototypes");
+  Out << "u2fp";
 }
 void CXXNameMangler::mangleBareFunctionType(const FunctionType *T,
                                             bool MangleReturnType) {

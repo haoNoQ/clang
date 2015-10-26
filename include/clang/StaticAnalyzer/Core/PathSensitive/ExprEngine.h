@@ -25,6 +25,7 @@
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/SubEngine.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/FunctionCallSummary.h"
 
 namespace clang {
 
@@ -46,17 +47,12 @@ class CallEvent;
 class SimpleCall;
 class CXXConstructorCall;
 
-class ExprEngine : public SubEngine {
-public:
-  /// The modes of inlining, which override the default analysis-wide settings.
-  enum InliningModes {
-    /// Follow the default settings for inlining callees.
-    Inline_Regular = 0,
-    /// Do minimal inlining of callees.
-    Inline_Minimal = 0x1
-  };
+typedef std::vector<const Decl *> SummaryConstructionStack;
 
+class ExprEngine : public SubEngine {
 private:
+  CompilerInstance &CI;
+
   AnalysisManager &AMgr;
   
   AnalysisDeclContextManager &AnalysisDeclContexts;
@@ -97,10 +93,20 @@ private:
   /// The flag, which specifies the mode of inlining for the engine.
   InliningModes HowToInline;
 
+  FunctionSummariesTy *FS;
+  CallSummaryMap *FCS;
+  SummaryConstructionStack &SCS;
+
+  unsigned int numInlinedCalls;
+
 public:
-  ExprEngine(AnalysisManager &mgr, bool gcEnabled,
+  ExprEngine(CompilerInstance &CI,
+             AnalysisManager &mgr, BasicValueFactory &BVF,
+             bool gcEnabled,
              SetOfConstDecls *VisitedCalleesIn,
              FunctionSummariesTy *FS,
+             CallSummaryMap *FCS,
+             SummaryConstructionStack &SCS,
              InliningModes HowToInlineIn);
 
   ~ExprEngine();
@@ -132,6 +138,10 @@ public:
   SValBuilder &getSValBuilder() { return svalBuilder; }
 
   BugReporter& getBugReporter() { return BR; }
+
+  CallSummaryMap &getCallSummaries() { return *FCS; }
+
+  CompilerInstance & getCompilerInstance() { return CI; }
 
   const NodeBuilderContext &getBuilderContext() {
     assert(currBldrCtx);
@@ -243,6 +253,10 @@ public:
   ///  nodes by processing the 'effects' of a switch statement.
   void processSwitch(SwitchNodeBuilder& builder);
 
+  /// ProcessCXXTry - Called by CoreEngine.  Used to generate successor
+  ///  nodes by processing the 'effects' of a try statement.
+  void processCXXTry(CXXTryNodeBuilder& builder);
+
   /// Called by CoreEngine.  Used to generate end-of-path
   /// nodes when the control reaches the end of a function.
   void processEndOfFunction(NodeBuilderContext& BC,
@@ -259,6 +273,10 @@ public:
   /// Generate the sequence of nodes that simulate the call exit and the post
   /// visit for CallExpr.
   void processCallExit(ExplodedNode *Pred);
+
+  /// Called by CoreEngine when the analysis worklist has just started.
+  void processBeginWorklist(ExplodedNode *Pred, ExplodedNodeSet &Dst,
+                            NodeBuilderContext *Ctx);
 
   /// Called by CoreEngine when the analysis worklist has terminated.
   void processEndWorklist(bool hasWorkRemaining);
@@ -305,8 +323,13 @@ public:
   bool wasBlocksExhausted() const { return Engine.wasBlocksExhausted(); }
   bool hasEmptyWorkList() const { return !Engine.getWorkList()->hasWork(); }
   bool hasWorkRemaining() const { return Engine.hasWorkRemaining(); }
+  InliningModes getHowToInline() const { return HowToInline; }
 
   const CoreEngine &getCoreEngine() const { return Engine; }
+
+  FunctionSummariesTy *getSummaries() { return FS; }
+
+  const SummaryConstructionStack &getSummaryStack() const { return SCS; }
 
 public:
   /// Visit - Transfer function logic for all statements.  Dispatches to
@@ -406,7 +429,10 @@ public:
   void VisitIncrementDecrementOperator(const UnaryOperator* U,
                                        ExplodedNode *Pred,
                                        ExplodedNodeSet &Dst);
-  
+
+  void VisitCXXThrowExpr(const CXXThrowExpr *CTE, ExplodedNode *Pred,
+                          ExplodedNodeSet &Dst);
+
   void VisitCXXCatchStmt(const CXXCatchStmt *CS, ExplodedNode *Pred,
                          ExplodedNodeSet &Dst);
 
@@ -570,6 +596,13 @@ private:
   /// call with a simple bind.
   void performTrivialCopy(NodeBuilder &Bldr, ExplodedNode *Pred,
                           const CallEvent &Call);
+
+  /// \brief check if child derived from parent
+  bool isTypeDerived(const Type *parent, const Type *child);
+
+  bool isExceptionThrown(ProgramStateRef State) const;
+
+  QualType getThrownExceptionType(ProgramStateRef State) const;
 
   /// If the value of the given expression is a NonLoc, copy it into a new
   /// temporary object region, and replace the value of the expression with

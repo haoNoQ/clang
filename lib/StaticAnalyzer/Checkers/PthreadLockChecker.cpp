@@ -128,13 +128,11 @@ void PthreadLockChecker::AcquireLock(CheckerContext &C, const CallExpr *CE,
     default:
       llvm_unreachable("Unknown tryLock locking semantics");
     }
-    assert(lockFail && lockSucc);
     C.addTransition(lockFail);
 
   } else if (semantics == PthreadSemantics) {
     // Assume that the return value was 0.
     lockSucc = state->assume(retVal, false);
-    assert(lockSucc);
 
   } else {
     // XNU locking semantics return void on non-try locks
@@ -142,9 +140,11 @@ void PthreadLockChecker::AcquireLock(CheckerContext &C, const CallExpr *CE,
     lockSucc = state;
   }
   
-  // Record that the lock was acquired.  
-  lockSucc = lockSucc->add<LockSet>(lockR);
-  C.addTransition(lockSucc);
+  if (lockSucc) {
+    // Record that the lock was acquired.
+    lockSucc = lockSucc->add<LockSet>(lockR);
+    C.addTransition(lockSucc);
+  }
 }
 
 void PthreadLockChecker::ReleaseLock(CheckerContext &C, const CallExpr *CE,

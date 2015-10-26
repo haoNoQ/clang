@@ -55,53 +55,60 @@ template<> struct FoldingSetTrait<SValPair> {
 typedef llvm::FoldingSet<llvm::FoldingSetNodeWrapper<SValData> >
   PersistentSValsTy;
 
-typedef llvm::FoldingSet<llvm::FoldingSetNodeWrapper<SValPair> >
-  PersistentSValPairsTy;
-
 BasicValueFactory::~BasicValueFactory() {
   // Note that the dstor for the contents of APSIntSet will never be called,
   // so we iterate over the set and invoke the dstor for each APSInt.  This
   // frees an aux. memory allocated to represent very large constants.
-  for (APSIntSetTy::iterator I=APSIntSet.begin(), E=APSIntSet.end(); I!=E; ++I)
-    I->getValue().~APSInt();
+  for (APValueSetTy::iterator I=APValueSet.begin(), E=APValueSet.end(); I!=E; ++I)
+    I->getValue().~APValue();
 
   delete (PersistentSValsTy*) PersistentSVals;
-  delete (PersistentSValPairsTy*) PersistentSValPairs;
 }
 
-const llvm::APSInt& BasicValueFactory::getValue(const llvm::APSInt& X) {
+const APValue& BasicValueFactory::getValue(const APValue& X) {
   llvm::FoldingSetNodeID ID;
   void *InsertPos;
-  typedef llvm::FoldingSetNodeWrapper<llvm::APSInt> FoldNodeTy;
+  typedef llvm::FoldingSetNodeWrapper<APValue> FoldNodeTy;
 
   X.Profile(ID);
-  FoldNodeTy* P = APSIntSet.FindNodeOrInsertPos(ID, InsertPos);
-
+  FoldNodeTy* P = APValueSet.FindNodeOrInsertPos(ID, InsertPos);
   if (!P) {
     P = (FoldNodeTy*) BPAlloc.Allocate<FoldNodeTy>();
     new (P) FoldNodeTy(X);
-    APSIntSet.InsertNode(P, InsertPos);
+    APValueSet.InsertNode(P, InsertPos);
   }
 
   return *P;
 }
 
-const llvm::APSInt& BasicValueFactory::getValue(const llvm::APInt& X,
+const APValue& BasicValueFactory::getValue(const llvm::APSInt& X) {
+  APValue V(X);
+  return getValue(V);
+}
+
+const APValue& BasicValueFactory::getValue(const llvm::APFloat& X) {
+  APValue V(X);
+  return getValue(V);
+}
+
+const APValue& BasicValueFactory::getValue(const llvm::APInt& X,
                                                 bool isUnsigned) {
-  llvm::APSInt V(X, isUnsigned);
+  llvm::APSInt I(X, isUnsigned);
+  APValue V(I);
   return getValue(V);
 }
 
-const llvm::APSInt& BasicValueFactory::getValue(uint64_t X, unsigned BitWidth,
+const APValue& BasicValueFactory::getValue(uint64_t X, unsigned BitWidth,
                                            bool isUnsigned) {
-  llvm::APSInt V(BitWidth, isUnsigned);
-  V = X;
+  llvm::APSInt I(BitWidth, isUnsigned);
+  I = X;
+  APValue V(I);
   return getValue(V);
 }
 
-const llvm::APSInt& BasicValueFactory::getValue(uint64_t X, QualType T) {
-
-  return getValue(getAPSIntType(T).getValue(X));
+const APValue& BasicValueFactory::getValue(uint64_t X, QualType T) {
+  APValue V(getAPSIntType(T).getValue(X));
+  return getValue(V);
 }
 
 const CompoundValData*
@@ -142,7 +149,7 @@ BasicValueFactory::getLazyCompoundValData(const StoreRef &store,
   return D;
 }
 
-const llvm::APSInt*
+const APValue*
 BasicValueFactory::evalAPSInt(BinaryOperator::Opcode Op,
                              const llvm::APSInt& V1, const llvm::APSInt& V2) {
 
@@ -154,9 +161,13 @@ BasicValueFactory::evalAPSInt(BinaryOperator::Opcode Op,
       return &getValue( V1 * V2 );
 
     case BO_Div:
+      if (V2 == 0) // Avoid division by zero
+        return NULL;
       return &getValue( V1 / V2 );
 
     case BO_Rem:
+      if (V2 == 0) // Avoid division by zero
+        return NULL;
       return &getValue( V1 % V2 );
 
     case BO_Add:
@@ -232,6 +243,62 @@ BasicValueFactory::evalAPSInt(BinaryOperator::Opcode Op,
   }
 }
 
+const APValue*
+BasicValueFactory::evalAPFloat(BinaryOperator::Opcode Op,
+                             const llvm::APFloat& V1, const llvm::APFloat& V2) {
+  llvm::APFloat Val1(V1);
+  llvm::APFloat Val2(V2);
+  bool losesInfo;
+  if(Val1.semanticsPrecision(Val1.getSemantics()) <
+      Val2.semanticsPrecision(Val2.getSemantics())) {
+    Val1.convert(Val2.getSemantics(),
+                 llvm::APFloat::rmNearestTiesToEven,
+                 &losesInfo);
+
+  } else if (Val1.semanticsPrecision(Val1.getSemantics()) >
+              Val2.semanticsPrecision(Val2.getSemantics())) {
+    Val2.convert(Val1.getSemantics(),
+                 llvm::APFloat::rmNearestTiesToEven,
+                 &losesInfo);
+  }
+  switch (Op) {
+    default:
+      assert (false && "Invalid Opcode.");
+
+    case BO_Mul:
+      Val1.multiply(Val2, llvm::APFloat::rmNearestTiesToEven);
+      return &getValue(Val1);
+    case BO_Div:
+      Val1.divide(Val2,llvm::APFloat::rmNearestTiesToEven);
+      return &getValue(Val1);
+    case BO_Add:
+      Val1.add(Val2,llvm::APFloat::rmNearestTiesToEven);
+      return &getValue(Val1);
+
+    case BO_Sub:
+      Val1.subtract(Val2,llvm::APFloat::rmNearestTiesToEven);
+      return &getValue(Val1);
+    case BO_LT:
+      return &getTruthValue( Val1.compareWithConversion(Val2) == llvm::APFloat::cmpLessThan );
+    case BO_GT:
+      return &getTruthValue( Val1.compareWithConversion(Val2) == llvm::APFloat::cmpGreaterThan );
+
+    case BO_LE:
+      return &getTruthValue( Val1.compareWithConversion(Val2) == llvm::APFloat::cmpLessThan ||
+                              Val1.compareWithConversion(Val2) == llvm::APFloat::cmpEqual);
+
+    case BO_GE:
+      return &getTruthValue( Val1.compareWithConversion(Val2) == llvm::APFloat::cmpGreaterThan ||
+                              Val1.compareWithConversion(Val2) == llvm::APFloat::cmpEqual );
+
+    case BO_EQ:
+      return &getTruthValue(Val1.compareWithConversion(Val2) == llvm::APFloat::cmpEqual );
+
+    case BO_NE:
+      return &getTruthValue(Val1.compareWithConversion(Val2) != llvm::APFloat::cmpEqual );
+
+  }
+}
 
 const std::pair<SVal, uintptr_t>&
 BasicValueFactory::getPersistentSValWithData(const SVal& V, uintptr_t Data) {
@@ -256,33 +323,4 @@ BasicValueFactory::getPersistentSValWithData(const SVal& V, uintptr_t Data) {
   }
 
   return P->getValue();
-}
-
-const std::pair<SVal, SVal>&
-BasicValueFactory::getPersistentSValPair(const SVal& V1, const SVal& V2) {
-
-  // Lazily create the folding set.
-  if (!PersistentSValPairs) PersistentSValPairs = new PersistentSValPairsTy();
-
-  llvm::FoldingSetNodeID ID;
-  void *InsertPos;
-  V1.Profile(ID);
-  V2.Profile(ID);
-
-  PersistentSValPairsTy& Map = *((PersistentSValPairsTy*) PersistentSValPairs);
-
-  typedef llvm::FoldingSetNodeWrapper<SValPair> FoldNodeTy;
-  FoldNodeTy* P = Map.FindNodeOrInsertPos(ID, InsertPos);
-
-  if (!P) {
-    P = (FoldNodeTy*) BPAlloc.Allocate<FoldNodeTy>();
-    new (P) FoldNodeTy(std::make_pair(V1, V2));
-    Map.InsertNode(P, InsertPos);
-  }
-
-  return P->getValue();
-}
-
-const SVal* BasicValueFactory::getPersistentSVal(SVal X) {
-  return &getPersistentSValWithData(X, 0).first;
 }

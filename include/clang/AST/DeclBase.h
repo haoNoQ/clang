@@ -297,6 +297,8 @@ protected:
 
   friend class ASTDeclWriter;
   friend class ASTDeclReader;
+  friend class ASTImporter;
+  friend class ASTNodeImporter;
   friend class ASTReader;
   friend class LinkageComputer;
 

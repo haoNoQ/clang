@@ -48,6 +48,30 @@ void IntSymExpr::dumpToStream(raw_ostream &os) const {
   os << ')';
 }
 
+void SymFloatExpr::dumpToStream(raw_ostream &os) const {
+  os << '(';
+  getLHS()->dumpToStream(os);
+  llvm::APFloat val = getRHS();
+  bool losesInfo;
+  val.convert(llvm::APFloat::IEEEdouble, llvm::APFloat::rmNearestTiesToEven,&losesInfo);
+  os << ") "
+     << BinaryOperator::getOpcodeStr(getOpcode()) << ' '
+     << val.convertToDouble();
+}
+
+void FloatSymExpr::dumpToStream(raw_ostream &os) const {
+  llvm::APFloat val = getLHS();
+  bool losesInfo;
+  val.convert(llvm::APFloat::IEEEdouble, llvm::APFloat::rmNearestTiesToEven,&losesInfo);
+  os << val.convertToDouble();
+  os << ' '
+     << BinaryOperator::getOpcodeStr(getOpcode())
+     << " (";
+  getRHS()->dumpToStream(os);
+  os << ')';
+}
+
+
 void SymSymExpr::dumpToStream(raw_ostream &os) const {
   os << '(';
   getLHS()->dumpToStream(os);
@@ -81,6 +105,15 @@ void SymbolMetadata::dumpToStream(raw_ostream &os) const {
   os << "meta_$" << getSymbolID() << '{'
      << getRegion() << ',' << T.getAsString() << '}';
 }
+
+void SymbolRegionAddress::dumpToStream(raw_ostream &os) const {
+  os << "addr_$" << getSymbolID() << '<' << Reg << '>';
+}
+
+void SymbolLabelAddress::dumpToStream(raw_ostream &os) const {
+  os << "label_addr_$" << getSymbolID() << '<' << LD->getNameAsString() << '>';
+}
+
 
 void SymbolData::anchor() { }
 
@@ -120,6 +153,8 @@ void SymExpr::symbol_iterator::expand() {
     case SymExpr::DerivedKind:
     case SymExpr::ExtentKind:
     case SymExpr::MetadataKind:
+    case SymExpr::RegionAddressKind:
+    case SymExpr::LabelAddressKind:
       return;
     case SymExpr::CastSymbolKind:
       itr.push_back(cast<SymbolCast>(SE)->getOperand());
@@ -129,6 +164,12 @@ void SymExpr::symbol_iterator::expand() {
       return;
     case SymExpr::IntSymKind:
       itr.push_back(cast<IntSymExpr>(SE)->getRHS());
+      return;
+    case SymExpr::SymFloatKind:
+          itr.push_back(cast<SymFloatExpr>(SE)->getLHS());
+          return;
+    case SymExpr::FloatSymKind:
+      itr.push_back(cast<FloatSymExpr>(SE)->getRHS());
       return;
     case SymExpr::SymSymKind: {
       const SymSymExpr *x = cast<SymSymExpr>(SE);
@@ -234,6 +275,40 @@ SymbolManager::getMetadataSymbol(const MemRegion* R, const Stmt *S, QualType T,
   return cast<SymbolMetadata>(SD);
 }
 
+const SymbolRegionAddress *
+SymbolManager::getRegionAddressSymbol(const MemRegion *reg) {
+  llvm::FoldingSetNodeID profile;
+  SymbolRegionAddress::Profile(profile, reg);
+  void *InsertPos;
+  SymExpr *SD = DataSet.FindNodeOrInsertPos(profile, InsertPos);
+
+  if (!SD) {
+    SD = (SymExpr*) BPAlloc.Allocate<SymbolRegionAddress>();
+    new (SD) SymbolRegionAddress(SymbolCounter, reg);
+    DataSet.InsertNode(SD, InsertPos);
+    ++SymbolCounter;
+  }
+
+  return cast<SymbolRegionAddress>(SD);
+}
+
+const SymbolLabelAddress *
+SymbolManager::getLabelAddressSymbol(const LabelDecl *ld) {
+  llvm::FoldingSetNodeID profile;
+  SymbolLabelAddress::Profile(profile, ld);
+  void *InsertPos;
+  SymExpr *SD = DataSet.FindNodeOrInsertPos(profile, InsertPos);
+
+  if (!SD) {
+    SD = (SymExpr*) BPAlloc.Allocate<SymbolLabelAddress>();
+    new (SD) SymbolLabelAddress(SymbolCounter, ld);
+    DataSet.InsertNode(SD, InsertPos);
+    ++SymbolCounter;
+  }
+
+  return cast<SymbolLabelAddress>(SD);
+}
+
 const SymbolCast*
 SymbolManager::getCastSymbol(const SymExpr *Op,
                              QualType From, QualType To) {
@@ -286,6 +361,43 @@ const IntSymExpr *SymbolManager::getIntSymExpr(const llvm::APSInt& lhs,
   return cast<IntSymExpr>(data);
 }
 
+
+const SymFloatExpr *SymbolManager::getSymFloatExpr(const SymExpr *lhs,
+                                               BinaryOperator::Opcode op,
+                                               const llvm::APFloat& v,
+                                               QualType t) {
+  llvm::FoldingSetNodeID ID;
+  SymFloatExpr::Profile(ID, lhs, op, v, t);
+  void *InsertPos;
+  SymExpr *data = DataSet.FindNodeOrInsertPos(ID, InsertPos);
+
+  if (!data) {
+    data = (SymFloatExpr*) BPAlloc.Allocate<SymFloatExpr>();
+    new (data) SymFloatExpr(lhs, op, v, t);
+    DataSet.InsertNode(data, InsertPos);
+  }
+
+  return cast<SymFloatExpr>(data);
+}
+
+const FloatSymExpr *SymbolManager::getFloatSymExpr(const llvm::APFloat& lhs,
+                                               BinaryOperator::Opcode op,
+                                               const SymExpr *rhs,
+                                               QualType t) {
+  llvm::FoldingSetNodeID ID;
+  FloatSymExpr::Profile(ID, lhs, op, rhs, t);
+  void *InsertPos;
+  SymExpr *data = DataSet.FindNodeOrInsertPos(ID, InsertPos);
+
+  if (!data) {
+    data = (FloatSymExpr*) BPAlloc.Allocate<FloatSymExpr>();
+    new (data) FloatSymExpr(lhs, op, rhs, t);
+    DataSet.InsertNode(data, InsertPos);
+  }
+
+  return cast<FloatSymExpr>(data);
+}
+
 const SymSymExpr *SymbolManager::getSymSymExpr(const SymExpr *lhs,
                                                BinaryOperator::Opcode op,
                                                const SymExpr *rhs,
@@ -325,6 +437,18 @@ QualType SymbolRegionValue::getType() const {
   return R->getValueType();
 }
 
+QualType SymbolRegionAddress::getType() const {
+  if (const TypedRegion *tr = dyn_cast<TypedRegion>(Reg))
+    return tr->getLocationType();
+  ASTContext &Ctx = Reg->getMemRegionManager()->getContext();
+  return Ctx.VoidPtrTy;
+}
+
+QualType SymbolLabelAddress::getType() const {
+  ASTContext &Ctx = LD->getASTContext();
+  return Ctx.VoidPtrTy;
+}
+
 SymbolManager::~SymbolManager() {
   for (SymbolDependTy::const_iterator I = SymbolDependencies.begin(),
        E = SymbolDependencies.end(); I != E; ++I) {
@@ -342,6 +466,8 @@ bool SymbolManager::canSymbolicate(QualType T) {
   if (T->isIntegralOrEnumerationType())
     return true;
 
+  if (T->isRealFloatingType())
+    return true;
   if (T->isRecordType() && !T->isUnionType())
     return true;
 
@@ -450,9 +576,12 @@ bool SymbolReaper::isLive(SymbolRef sym) {
   bool KnownLive;
   
   switch (sym->getKind()) {
-  case SymExpr::RegionValueKind:
-    KnownLive = isLiveRegion(cast<SymbolRegionValue>(sym)->getRegion());
+  case SymExpr::RegionValueKind: {
+    const MemRegion *MR = cast<SymbolRegionValue>(sym)->getRegion();
+    KnownLive = !reapedStore.getStoreManager().hasDirectBinding(
+          reapedStore.getStore(), MR);
     break;
+  }
   case SymExpr::ConjuredKind:
     KnownLive = false;
     break;
@@ -468,11 +597,23 @@ bool SymbolReaper::isLive(SymbolRef sym) {
     if (KnownLive)
       MetadataInUse.erase(sym);
     break;
+  case SymExpr::RegionAddressKind:
+    KnownLive = isLiveRegion(cast<SymbolRegionAddress>(sym)->getRegion());
+    break;
+  case SymExpr::LabelAddressKind:
+    KnownLive = false;
+    break;
   case SymExpr::SymIntKind:
     KnownLive = isLive(cast<SymIntExpr>(sym)->getLHS());
     break;
   case SymExpr::IntSymKind:
     KnownLive = isLive(cast<IntSymExpr>(sym)->getRHS());
+    break;
+  case SymExpr::SymFloatKind:
+    KnownLive = isLive(cast<SymFloatExpr>(sym)->getLHS());
+    break;
+  case SymExpr::FloatSymKind:
+    KnownLive = isLive(cast<FloatSymExpr>(sym)->getRHS());
     break;
   case SymExpr::SymSymKind:
     KnownLive = isLive(cast<SymSymExpr>(sym)->getLHS()) &&

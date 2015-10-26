@@ -1,3 +1,4 @@
+
 clang_tablegen(Checkers.inc -gen-clang-sa-checkers
   -I ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
   SOURCE Checkers.td
@@ -23,6 +24,7 @@ add_clang_library(clangStaticAnalyzerCheckers
   CheckerDocumentation.cpp
   ChrootChecker.cpp
   ClangCheckers.cpp
+  ConstModifiedChecker.cpp
   DeadStoresChecker.cpp
   DebugCheckers.cpp
   DereferenceChecker.cpp
@@ -34,6 +36,7 @@ add_clang_library(clangStaticAnalyzerCheckers
   GenericTaintChecker.cpp
   IdempotentOperationChecker.cpp
   IdenticalExprChecker.cpp
+  IntegerOverflowChecker.cpp
   IvarInvalidationChecker.cpp
   LLVMConventionsChecker.cpp
   MacOSKeychainAPIChecker.cpp

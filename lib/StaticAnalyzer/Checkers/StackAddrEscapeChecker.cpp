@@ -175,10 +175,10 @@ void StackAddrEscapeChecker::checkEndFunction(CheckerContext &Ctx) const {
       Ctx(CC),
       CurSFC(CC.getLocationContext()->getCurrentStackFrame())
     {}
-    
-    bool HandleBinding(StoreManager &SMgr, Store store,
-                       const MemRegion *region, SVal val) {
-      
+
+    bool HandleBinding(StoreManager &SMgr, Store store, const MemRegion *region,
+                       uint64_t Offset, SVal val, bool Direct) {
+
       if (!isa<GlobalsSpaceRegion>(region->getMemorySpace()))
         return true;
       

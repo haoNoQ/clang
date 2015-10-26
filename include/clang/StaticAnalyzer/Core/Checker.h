@@ -212,6 +212,20 @@ public:
   }
 };
 
+class BeginAnalysis {
+  template <typename CHECKER>
+  static void _checkBeginAnalysis(void *checker, CheckerContext &C) {
+    ((const CHECKER *)checker)->checkBeginAnalysis(C);
+  }
+
+public:
+  template <typename CHECKER>
+  static void _register(CHECKER *checker, CheckerManager &mgr) {
+    mgr._registerForBeginAnalysis(
+     CheckerManager::CheckBeginAnalysisFunc(checker, _checkBeginAnalysis<CHECKER>));
+  }
+};
+
 class EndAnalysis {
   template <typename CHECKER>
   static void _checkEndAnalysis(void *checker, ExplodedGraph &G,
@@ -447,6 +461,53 @@ public:
   static void _register(CHECKER *checker, CheckerManager &mgr) {
     mgr._registerForEvalCall(
                      CheckerManager::EvalCallFunc(checker, _evalCall<CHECKER>));
+  }
+};
+
+class SummaryPopulate {
+  template <typename CHECKER>
+  static const void *_evalSummaryPopulate(void *checker,
+                                          ProgramStateRef state) {
+    return ((const CHECKER *)checker)->evalSummaryPopulate(state);
+  }
+
+public:
+  template <typename CHECKER>
+  static void _register(CHECKER *checker, CheckerManager &mgr) {
+    mgr._registerForEvalSummaryPopulate(CheckerManager::EvalSummaryPopulateFunc(
+        checker, _evalSummaryPopulate<CHECKER>));
+  }
+};
+
+class SummaryApply {
+  template <typename CHECKER>
+  static void _evalSummaryApply(void *checker, Summarizer &S,
+                                const CallEvent &Call, const void *summary,
+                                CheckerContext &C,
+                                ProgramStateRef CalleeEndState) {
+    return ((const CHECKER *)checker)->evalSummaryApply(S, Call, summary, C,
+                                                        CalleeEndState);
+  }
+
+public:
+  template <typename CHECKER>
+  static void _register(CHECKER *checker, CheckerManager &mgr) {
+    mgr._registerForEvalSummaryApply(CheckerManager::EvalSummaryApplyFunc(
+        checker, _evalSummaryApply<CHECKER>));
+  }
+};
+
+class SummarySVal {
+  template <typename CHECKER>
+  static SVal _evalSummarySVal(void *checker, Summarizer &S, SVal SV) {
+    return ((const CHECKER *)checker)->evalSummarySVal(S, SV);
+  }
+
+public:
+  template <typename CHECKER>
+  static void _register(CHECKER *checker, CheckerManager &mgr) {
+    mgr._registerForEvalSummarySVal(CheckerManager::EvalSummarySValFunc(
+        checker, _evalSummarySVal<CHECKER>));
   }
 };
 

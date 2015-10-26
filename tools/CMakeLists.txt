@@ -12,6 +12,8 @@ if(CLANG_ENABLE_ARCMT)
 endif()
 if(CLANG_ENABLE_STATIC_ANALYZER)
   add_subdirectory(clang-check)
+  add_subdirectory(clang-func-mapping)
+  add_subdirectory(clang-cmdline-arch-extractor)
 endif()
 
 # We support checking out the clang-tools-extra repository into the 'extra'

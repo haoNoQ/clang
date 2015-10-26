@@ -18,14 +18,19 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
+#include "clang/AST/Mangle.h"
 #include "clang/AST/ParentMap.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Analysis/Analyses/LiveVariables.h"
 #include "clang/Analysis/CFG.h"
 #include "clang/Analysis/CallGraph.h"
 #include "clang/Basic/FileManager.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Sema/Sema.h"
 #include "clang/StaticAnalyzer/Checkers/LocalCheckers.h"
 #include "clang/StaticAnalyzer/Core/AnalyzerOptions.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
@@ -40,18 +45,50 @@
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <queue>
+#include <sys/file.h>
+#include <unistd.h>
+#include <fstream>
+#include <time.h>
+
 
 using namespace clang;
 using namespace ento;
 using llvm::SmallPtrSet;
 
 static ExplodedNode::Auditor* CreateUbiViz();
+
+class ASTDtorCreator {
+private:
+  ASTContext &Ctx;
+  Sema &S;
+
+public:
+  ASTDtorCreator(ASTContext &Context, Sema &S) : Ctx(Context), S(S) {}
+  void Start() { HandleDecl(Ctx.getTranslationUnitDecl()); }
+
+private:
+  void HandleDecl(Decl *D) {
+    assert(Ctx.getLangOpts().CPlusPlus && "Needs to call for C++ only!");
+    if (!D)
+      return;
+    if (CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(D))
+      if (RD->isCompleteDefinition() && RD->needsImplicitDestructor() &&
+          !RD->getDestructor() && !RD->isDependentType())
+        S.DeclareImplicitDestructor(RD);
+    if (DeclContext *DC = dyn_cast<DeclContext>(D))
+      for (DeclContext::decl_iterator I = DC->decls_begin(),
+           E = DC->decls_end(); I != E; ++I)
+        HandleDecl(*I);
+  }
+};
+
 
 STATISTIC(NumFunctionTopLevel, "The # of functions at top level.");
 STATISTIC(NumFunctionsAnalyzed,
@@ -177,6 +214,7 @@ public:
   const std::string OutDir;
   AnalyzerOptionsRef Opts;
   ArrayRef<std::string> Plugins;
+  CompilerInstance &CI;
 
   /// \brief Stores the declarations from the local translation unit.
   /// Note, we pre-compute the local declarations at parse time as an
@@ -201,12 +239,17 @@ public:
   /// translation unit.
   FunctionSummariesTy FunctionSummaries;
 
-  AnalysisConsumer(const Preprocessor& pp,
+  CallSummaryMap FunctionCallSummaries;
+
+  OwningPtr<BasicValueFactory> BVF;
+
+  AnalysisConsumer(CompilerInstance &CI,
+                   const Preprocessor& pp,
                    const std::string& outdir,
                    AnalyzerOptionsRef opts,
                    ArrayRef<std::string> plugins)
     : RecVisitorMode(0), RecVisitorBR(0),
-      Ctx(0), PP(pp), OutDir(outdir), Opts(opts), Plugins(plugins) {
+      Ctx(0), PP(pp), OutDir(outdir), Opts(opts), Plugins(plugins), CI(CI) {
     DigestAnalyzerOptions();
     if (Opts->PrintStats) {
       llvm::EnableStatistics();
@@ -256,8 +299,7 @@ public:
     }
   }
 
-  void DisplayFunction(const Decl *D, AnalysisMode Mode,
-                       ExprEngine::InliningModes IMode) {
+  void DisplayFunction(const Decl *D, AnalysisMode Mode, InliningModes IMode) {
     if (!Opts->AnalyzerDisplayProgress)
       return;
 
@@ -271,11 +313,14 @@ public:
       else if (Mode == AM_Path) {
         llvm::errs() << " (Path, ";
         switch (IMode) {
-          case ExprEngine::Inline_Minimal:
+          case Inline_Minimal:
             llvm::errs() << " Inline_Minimal";
             break;
-          case ExprEngine::Inline_Regular:
+          case Inline_Regular:
             llvm::errs() << " Inline_Regular";
+            break;
+          case Inline_Summary:
+            llvm::errs() << " Inline_Summary";
             break;
         }
         llvm::errs() << ")";
@@ -311,6 +356,8 @@ public:
                                   CreateConstraintMgr,
                                   checkerMgr.get(),
                                   *Opts));
+
+    BVF.reset(new BasicValueFactory(*Ctx));
   }
 
   /// \brief Store the top level decls in the set to be processed later on.
@@ -323,8 +370,14 @@ public:
   /// \brief Determine which inlining mode should be used when this function is
   /// analyzed. This allows to redefine the default inlining policies when
   /// analyzing a given function.
-  ExprEngine::InliningModes
-  getInliningModeForFunction(const Decl *D, SetOfConstDecls Visited);
+  InliningModes getInliningModeForFunction(const Decl *D,
+                                           SetOfConstDecls Visited);
+
+  /// \brief Determine if function should not be analyzed.
+  bool shouldSkipFunction(const Decl *D, SetOfConstDecls Visited,
+                          SetOfConstDecls VisitedAsTopLevel,
+                          std::set<std::string> &VisitedAsXTU,
+                          MangleContext *MangleCtx, const std::string &Triple);
 
   /// \brief Build the call graph for all the top level decls of this TU and
   /// use it to define the order in which the functions should be visited.
@@ -337,14 +390,12 @@ public:
   /// set of functions which should be considered analyzed after analyzing the
   /// given root function.
   void HandleCode(Decl *D, AnalysisMode Mode,
-                  ExprEngine::InliningModes IMode = ExprEngine::Inline_Minimal,
+                  InliningModes IMode = Inline_Minimal,
                   SetOfConstDecls *VisitedCallees = 0);
 
-  void RunPathSensitiveChecks(Decl *D,
-                              ExprEngine::InliningModes IMode,
+  void RunPathSensitiveChecks(Decl *D, InliningModes IMode,
                               SetOfConstDecls *VisitedCallees);
-  void ActionExprEngine(Decl *D, bool ObjCGCEnabled,
-                        ExprEngine::InliningModes IMode,
+  void ActionExprEngine(Decl *D, bool ObjCGCEnabled, InliningModes IMode,
                         SetOfConstDecls *VisitedCallees);
 
   /// Visitors for the RecursiveASTVisitor.
@@ -425,9 +476,26 @@ void AnalysisConsumer::storeTopLevelDecls(DeclGroupRef DG) {
   }
 }
 
-static bool shouldSkipFunction(const Decl *D,
-                               SetOfConstDecls Visited,
-                               SetOfConstDecls VisitedAsTopLevel) {
+extern std::string getMangledName(const NamedDecl *ND,
+                                  MangleContext *MangleCtx);
+extern char *getExplicitBuildDir();
+
+void lockedWrite(const std::string &fileName, const std::string &content) {
+  if (!content.empty()) {
+    int fd = open(fileName.c_str(), O_CREAT|O_WRONLY|O_APPEND, 0777);
+    flock(fd, LOCK_EX);
+    write(fd, content.c_str(), content.length());
+    flock(fd, LOCK_UN);
+    close(fd);
+  }
+}
+
+bool AnalysisConsumer::shouldSkipFunction(const Decl *D,
+                                          SetOfConstDecls Visited,
+                                          SetOfConstDecls VisitedAsTopLevel,
+                                          std::set<std::string> &VisitedAsXTU,
+                                          MangleContext *MangleCtx,
+                                          const std::string &Triple) {
   if (VisitedAsTopLevel.count(D))
     return true;
 
@@ -442,27 +510,54 @@ static bool shouldSkipFunction(const Decl *D,
     return false;
 
   // Otherwise, if we visited the function before, do not reanalyze it.
-  return Visited.count(D);
+  const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+  if (Visited.count(D)) {
+    if (Opts->getIPAMode() == IPAK_Summary)
+      return true; // Functions analyzed in summary are analyzed completely
+    if (D->getAccess() == AS_private)
+      return true;
+    if (FD && !FD->hasExternalFormalLinkage())
+      return true;
+  }
+
+  if (FD) {
+    std::string MangledFnName =
+        getMangledName(FD, MangleCtx) + "@" + Triple;
+    if (VisitedAsXTU.count(MangledFnName))
+      return true;
+  }
+
+  return false;
 }
 
-ExprEngine::InliningModes
+InliningModes
 AnalysisConsumer::getInliningModeForFunction(const Decl *D,
                                              SetOfConstDecls Visited) {
+  if (Opts->getIPAMode() == IPAK_Summary)
+    return Inline_Summary;
   // We want to reanalyze all ObjC methods as top level to report Retain
   // Count naming convention errors more aggressively. But we should tune down
   // inlining when reanalyzing an already inlined function.
-  if (Visited.count(D)) {
-    assert(isa<ObjCMethodDecl>(D) &&
-           "We are only reanalyzing ObjCMethods.");
-    const ObjCMethodDecl *ObjCM = cast<ObjCMethodDecl>(D);
-    if (ObjCM->getMethodFamily() != OMF_init)
-      return ExprEngine::Inline_Minimal;
-  }
+  if (Visited.count(D))
+    if (const ObjCMethodDecl *ObjCM = dyn_cast<ObjCMethodDecl>(D))
+      if (ObjCM->getMethodFamily() != OMF_init)
+        return Inline_Minimal;
 
-  return ExprEngine::Inline_Regular;
+  return Inline_Regular;
 }
 
 void AnalysisConsumer::HandleDeclsCallGraph(const unsigned LocalTUDeclsSize) {
+
+  IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts = new DiagnosticOptions();
+  IntrusiveRefCntPtr<DiagnosticIDs> DiagID(new DiagnosticIDs());
+  TextDiagnosticPrinter *DiagClient =
+      new TextDiagnosticPrinter(llvm::errs(), &*DiagOpts);
+  DiagnosticsEngine Diags(DiagID, &*DiagOpts, DiagClient);
+  llvm::OwningPtr<MangleContext> MangleCtx(
+      ItaniumMangleContext::create(*Ctx, Diags));
+  MangleCtx->setShouldForceMangleProto(true);
+  std::string Triple = Ctx->getTargetInfo().getTriple().getTriple();
+
   // Build the Call Graph by adding all the top level declarations to the graph.
   // Note: CallGraph can trigger deserialization of more items from a pch
   // (though HandleInterestingDecl); triggering additions to LocalTUDecls.
@@ -480,6 +575,25 @@ void AnalysisConsumer::HandleDeclsCallGraph(const unsigned LocalTUDeclsSize) {
   // often.
   SetOfConstDecls Visited;
   SetOfConstDecls VisitedAsTopLevel;
+
+
+  std::set<std::string> VisitedAsXTU;
+  std::string VisitedFuncSetFile;
+  const char *BuildDir = getExplicitBuildDir();
+  if (BuildDir) {
+    clock_t t1 = clock();
+    VisitedFuncSetFile = std::string(BuildDir) + "/visitedFunc.txt";
+    std::ifstream VisitedFuncSetStream(VisitedFuncSetFile.c_str());
+    std::string FunctionName;
+    while (VisitedFuncSetStream >> FunctionName)
+      VisitedAsXTU.insert(FunctionName);
+    VisitedFuncSetStream.close();
+    clock_t t2 = clock();
+    llvm::errs() << "! Reading " << VisitedFuncSetFile << " took "
+                 << ((double)(t2 - t1)) / ((double)CLOCKS_PER_SEC)
+                 << " seconds\n";
+  }
+
   llvm::ReversePostOrderTraversal<clang::CallGraph*> RPOT(&CG);
   for (llvm::ReversePostOrderTraversal<clang::CallGraph*>::rpo_iterator
          I = RPOT.begin(), E = RPOT.end(); I != E; ++I) {
@@ -494,7 +608,8 @@ void AnalysisConsumer::HandleDeclsCallGraph(const unsigned LocalTUDeclsSize) {
 
     // Skip the functions which have been processed already or previously
     // inlined.
-    if (shouldSkipFunction(D, Visited, VisitedAsTopLevel))
+    if (shouldSkipFunction(D->getCanonicalDecl(), Visited, VisitedAsTopLevel,
+                           VisitedAsXTU, MangleCtx.get(), Triple))
       continue;
 
     // Analyze the function.
@@ -510,9 +625,59 @@ void AnalysisConsumer::HandleDeclsCallGraph(const unsigned LocalTUDeclsSize) {
     }
     VisitedAsTopLevel.insert(D);
   }
+
+  if (BuildDir) {
+    clock_t t1 = clock();
+    std::set<std::string> NewVisited;
+
+    // FIXME: Unify these loops
+    for (SetOfConstDecls::iterator i = Visited.begin(), e = Visited.end();
+         i != e; ++i) {
+      std::string MN =
+          getMangledName(dyn_cast_or_null<FunctionDecl>(*i), MangleCtx.get()) +
+          '@' + Triple;
+      if (!VisitedAsXTU.count(MN))
+        NewVisited.insert(MN);
+    }
+
+    for (SetOfConstDecls::iterator i = VisitedAsTopLevel.begin(),
+                                   e = VisitedAsTopLevel.end();
+         i != e; ++i) {
+      std::string MN =
+          getMangledName(dyn_cast_or_null<FunctionDecl>(*i), MangleCtx.get()) +
+          '@' + Triple;
+      if (!VisitedAsXTU.count(MN))
+        NewVisited.insert(MN);
+    }
+
+    for (CallSummaryMap::const_iterator i = FunctionCallSummaries.begin(),
+                                        e = FunctionCallSummaries.end();
+         i != e; ++i) {
+      std::string MN = getMangledName(dyn_cast_or_null<FunctionDecl>(i->first),
+                                      MangleCtx.get()) +
+                       '@' + Triple;
+      if (!VisitedAsXTU.count(MN))
+        NewVisited.insert(MN);
+    }
+
+    std::string NewVisitedString;
+    for (std::set<std::string>::const_iterator i = NewVisited.begin(),
+                                               e = NewVisited.end();
+         i != e; ++i)
+      NewVisitedString += (*i) + "\n";
+    lockedWrite(VisitedFuncSetFile, NewVisitedString);
+    clock_t t2 = clock();
+    llvm::errs() << "! Writing " << VisitedFuncSetFile << " took "
+                 << ((double)(t2 - t1)) / ((double)CLOCKS_PER_SEC)
+                 << " seconds\n";
+  }
 }
 
 void AnalysisConsumer::HandleTranslationUnit(ASTContext &C) {
+  if (C.getLangOpts().CPlusPlus) {
+    ASTDtorCreator Corrector(C, CI.getSema());
+    Corrector.Start();
+  }
   // Don't run the actions if an error has occurred with parsing the file.
   DiagnosticsEngine &Diags = PP.getDiagnostics();
   if (Diags.hasErrorOccurred() || Diags.hasFatalErrorOccurred())
@@ -595,7 +760,9 @@ AnalysisConsumer::getModeForDecl(Decl *D, AnalysisMode Mode) {
   // - Header files: run non-path-sensitive checks only.
   // - System headers: don't run any checks.
   SourceManager &SM = Ctx->getSourceManager();
-  SourceLocation SL = SM.getExpansionLoc(D->getLocation());
+  SourceLocation SL = SM.getExpansionLoc(D->hasBody()
+                                         ? D->getBody()->getLocStart()
+                                         : D->getLocation());
   if (!Opts->AnalyzeAll && !SM.isInMainFile(SL)) {
     if (SL.isInvalid() || SM.isInSystemHeader(SL))
       return AM_None;
@@ -606,7 +773,7 @@ AnalysisConsumer::getModeForDecl(Decl *D, AnalysisMode Mode) {
 }
 
 void AnalysisConsumer::HandleCode(Decl *D, AnalysisMode Mode,
-                                  ExprEngine::InliningModes IMode,
+                                  InliningModes IMode,
                                   SetOfConstDecls *VisitedCallees) {
   if (!D->hasBody())
     return;
@@ -622,15 +789,22 @@ void AnalysisConsumer::HandleCode(Decl *D, AnalysisMode Mode,
   }
 
   // Clear the AnalysisManager of old AnalysisDeclContexts.
-  Mgr->ClearContexts();
   BugReporter BR(*Mgr);
 
   if (Mode & AM_Syntax)
     checkerMgr->runCheckersOnASTBody(D, *Mgr, BR);
   if ((Mode & AM_Path) && checkerMgr->hasPathSensitiveCheckers()) {
-    RunPathSensitiveChecks(D, IMode, VisitedCallees);
-    if (IMode != ExprEngine::Inline_Minimal)
-      NumFunctionsAnalyzed++;
+    if (IMode == Inline_Summary) {
+      if (VisitedCallees && !VisitedCallees->count(D)) {
+        RunPathSensitiveChecks(D, IMode, VisitedCallees);
+        if (IMode != Inline_Minimal)
+          NumFunctionsAnalyzed++;
+      }
+    } else {
+      RunPathSensitiveChecks(D, IMode, VisitedCallees);
+      if (IMode != Inline_Minimal)
+        NumFunctionsAnalyzed++;
+    }
   }
 }
 
@@ -639,8 +813,9 @@ void AnalysisConsumer::HandleCode(Decl *D, AnalysisMode Mode,
 //===----------------------------------------------------------------------===//
 
 void AnalysisConsumer::ActionExprEngine(Decl *D, bool ObjCGCEnabled,
-                                        ExprEngine::InliningModes IMode,
+                                        InliningModes IMode,
                                         SetOfConstDecls *VisitedCallees) {
+  D = D->getCanonicalDecl();
   // Construct the analysis engine.  First check if the CFG is valid.
   // FIXME: Inter-procedural analysis will need to handle invalid CFGs.
   if (!Mgr->getCFG(D))
@@ -650,7 +825,13 @@ void AnalysisConsumer::ActionExprEngine(Decl *D, bool ObjCGCEnabled,
   if (!Mgr->getAnalysisDeclContext(D)->getAnalysis<RelaxedLiveVariables>())
     return;
 
-  ExprEngine Eng(*Mgr, ObjCGCEnabled, VisitedCallees, &FunctionSummaries,IMode);
+  SummaryConstructionStack SCS;
+  SCS.push_back(D);
+  if (IMode != Inline_Summary)
+    BVF.reset(new BasicValueFactory(D->getASTContext()));
+  ExprEngine *Eng =
+      new ExprEngine(CI, *Mgr, *BVF, ObjCGCEnabled, VisitedCallees,
+                     &FunctionSummaries, &FunctionCallSummaries, SCS, IMode);
 
   // Set the graph auditor.
   OwningPtr<ExplodedNode::Auditor> Auditor;
@@ -660,23 +841,51 @@ void AnalysisConsumer::ActionExprEngine(Decl *D, bool ObjCGCEnabled,
   }
 
   // Execute the worklist algorithm.
-  Eng.ExecuteWorkList(Mgr->getAnalysisDeclContextManager().getStackFrame(D),
-                      Mgr->options.getMaxNodesPerTopLevelFunction());
+  bool Exceed = Eng->ExecuteWorkList(
+        Mgr->getAnalysisDeclContextManager().getStackFrame(D),
+        Mgr->options.getMaxNodesPerTopLevelFunction());
+  if (const FunctionDecl *FD = dyn_cast<FunctionDecl>(D)) {
+    IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts = new DiagnosticOptions();
+    IntrusiveRefCntPtr<DiagnosticIDs> DiagID(new DiagnosticIDs());
+    TextDiagnosticPrinter *DiagClient =
+        new TextDiagnosticPrinter(llvm::errs(), &*DiagOpts);
+    DiagnosticsEngine Diags(DiagID, &*DiagOpts, DiagClient);
+    llvm::OwningPtr<MangleContext> MangleCtx(
+        ItaniumMangleContext::create(*Ctx, Diags));
+    MangleCtx->setShouldForceMangleProto(true);
+    llvm::errs() << getMangledName(FD, MangleCtx.get()) << " " <<
+                    (Eng->hasEmptyWorkList()
+                            ? "empty" : "has_work") << "_wl " <<
+          (Eng->wasBlocksExhausted() ? "block_exhausted" : "not_exhausted") <<
+                    " " << (Eng->getCoreEngine().wasBlockAborted()
+                            ? "has" : "no") << "_block_aborted"
+                    " " << FunctionSummaries.getNodesCount(D) << "\n";
+  }
 
+  FunctionCallSummaries[D].isValid = !Exceed;
   // Release the auditor (if any) so that it doesn't monitor the graph
   // created BugReporter.
   ExplodedNode::SetAuditor(0);
 
   // Visualize the exploded graph.
   if (Mgr->options.visualizeExplodedGraphWithGraphViz)
-    Eng.ViewGraph(Mgr->options.TrimGraph);
+    Eng->ViewGraph(Mgr->options.TrimGraph);
 
   // Display warnings.
-  Eng.getBugReporter().FlushReports();
+  Eng->getBugReporter().FlushReports();
+  CallSummaryMap::iterator Summary = FunctionCallSummaries.find(D);
+  if (Mgr->getAnalyzerOptions().getIPAMode() != IPAK_Summary ||
+      !Summary->second.isValid || Summary->second.empty()) {
+    delete Eng;
+  } else {
+//    Eng->getStateManager().printStats();
+    Eng->getGraph().ReclaimIneffectiveNodes();
+//    Eng->getStateManager().printStats();
+//    llvm::errs() << "\n";
+  }
 }
 
-void AnalysisConsumer::RunPathSensitiveChecks(Decl *D,
-                                              ExprEngine::InliningModes IMode,
+void AnalysisConsumer::RunPathSensitiveChecks(Decl *D, InliningModes IMode,
                                               SetOfConstDecls *Visited) {
 
   switch (Mgr->getLangOpts().getGC()) {
@@ -699,14 +908,15 @@ void AnalysisConsumer::RunPathSensitiveChecks(Decl *D,
 // AnalysisConsumer creation.
 //===----------------------------------------------------------------------===//
 
-ASTConsumer* ento::CreateAnalysisConsumer(const Preprocessor& pp,
+ASTConsumer* ento::CreateAnalysisConsumer(CompilerInstance &CI,
+                                          const Preprocessor& pp,
                                           const std::string& outDir,
                                           AnalyzerOptionsRef opts,
                                           ArrayRef<std::string> plugins) {
   // Disable the effects of '-Werror' when using the AnalysisConsumer.
   pp.getDiagnostics().setWarningsAsErrors(false);
 
-  return new AnalysisConsumer(pp, outDir, opts, plugins);
+  return new AnalysisConsumer(CI, pp, outDir, opts, plugins);
 }
 
 //===----------------------------------------------------------------------===//

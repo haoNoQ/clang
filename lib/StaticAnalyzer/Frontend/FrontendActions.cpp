@@ -15,7 +15,7 @@ using namespace ento;
 
 ASTConsumer *AnalysisAction::CreateASTConsumer(CompilerInstance &CI,
                                                StringRef InFile) {
-  return CreateAnalysisConsumer(CI.getPreprocessor(),
+  return CreateAnalysisConsumer(CI, CI.getPreprocessor(),
                                 CI.getFrontendOpts().OutputFile,
                                 CI.getAnalyzerOpts(),
                                 CI.getFrontendOpts().Plugins);

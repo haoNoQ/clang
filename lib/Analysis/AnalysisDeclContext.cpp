@@ -575,4 +575,3 @@ void LocationContextManager::clear() {
 
   Contexts.clear();
 }
-

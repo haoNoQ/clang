@@ -16,10 +16,12 @@
 #define LLVM_CLANG_GR_COREENGINE
 
 #include "clang/AST/Expr.h"
+#include "clang/AST/StmtCXX.h"
 #include "clang/Analysis/AnalysisContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/BlockCounter.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ExplodedGraph.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/FunctionSummary.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/FunctionCallSummary.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/WorkList.h"
 #include "llvm/ADT/OwningPtr.h"
 
@@ -30,6 +32,17 @@ class ProgramPointTag;
 namespace ento {
 
 class NodeBuilder;
+struct NodeBuilderContext;
+
+/// The modes of inlining, which override the default analysis-wide settings.
+enum InliningModes {
+  /// Follow the default settings for inlining callees.
+  Inline_Regular = 0,
+  /// Do minimal inlining of callees.
+  Inline_Minimal = 0x1,
+  /// Summary-based IPA approach.
+  Inline_Summary = 0x2
+};
 
 //===----------------------------------------------------------------------===//
 /// CoreEngine - Implements the core logic of the graph-reachability
@@ -47,6 +60,7 @@ class CoreEngine {
   friend class CommonNodeBuilder;
   friend class IndirectGotoNodeBuilder;
   friend class SwitchNodeBuilder;
+  friend class CXXTryNodeBuilder;
   friend class EndOfFunctionNodeBuilder;
 public:
   typedef std::vector<std::pair<BlockEdge, const ExplodedNode*> >
@@ -80,9 +94,13 @@ private:
   /// usually because it could not reason about something.
   BlocksAborted blocksAborted;
 
+  InliningModes HowToInline;
+
   /// The information about functions shared by the whole translation unit.
   /// (This data is owned by AnalysisConsumer.)
   FunctionSummariesTy *FunctionSummaries;
+
+  CallSummaryMap *CurrentCallSummary;
 
   void generateNode(const ProgramPoint &Loc,
                     ProgramStateRef State,
@@ -90,7 +108,8 @@ private:
 
   void HandleBlockEdge(const BlockEdge &E, ExplodedNode *Pred);
   void HandleBlockEntrance(const BlockEntrance &E, ExplodedNode *Pred);
-  void HandleBlockExit(const CFGBlock *B, ExplodedNode *Pred);
+  void HandleBlockExit(const CFGBlock *B, ExplodedNode *Pred,
+                       NodeBuilderContext *Ctx);
   void HandlePostStmt(const CFGBlock *B, unsigned StmtIdx, ExplodedNode *Pred);
 
   void HandleBranch(const Stmt *Cond, const Stmt *Term, const CFGBlock *B,
@@ -108,12 +127,15 @@ private:
 
 public:
   /// Construct a CoreEngine object to analyze the provided CFG.
-  CoreEngine(SubEngine& subengine,
-             FunctionSummariesTy *FS)
+  CoreEngine(SubEngine& subengine, InliningModes HowToInlineIn,
+             FunctionSummariesTy *FS,
+             CallSummaryMap *FCS)
     : SubEng(subengine), G(new ExplodedGraph()),
       WList(WorkList::makeDFS()),
       BCounterFactory(G->getAllocator()),
-      FunctionSummaries(FS){}
+      HowToInline(HowToInlineIn),
+      FunctionSummaries(FS),
+      CurrentCallSummary(FCS){}
 
   /// getGraph - Returns the exploded graph.
   ExplodedGraph& getGraph() { return *G.get(); }
@@ -496,11 +518,13 @@ class SwitchNodeBuilder {
   const CFGBlock *Src;
   const Expr *Condition;
   ExplodedNode *Pred;
+  NodeBuilderContext *Ctx;
 
 public:
   SwitchNodeBuilder(ExplodedNode *pred, const CFGBlock *src,
-                    const Expr *condition, CoreEngine* eng)
-  : Eng(*eng), Src(src), Condition(condition), Pred(pred) {}
+                    const Expr *condition, CoreEngine* eng,
+                    NodeBuilderContext *C)
+  : Eng(*eng), Src(src), Condition(condition), Pred(pred), Ctx(C) {}
 
   class iterator {
     CFGBlock::const_succ_reverse_iterator I;
@@ -541,6 +565,38 @@ public:
   
   const LocationContext *getLocationContext() const {
     return Pred->getLocationContext();
+  }
+
+  const NodeBuilderContext *getBuilderContext() { return Ctx; }
+};
+
+class CXXTryNodeBuilder {
+  CoreEngine& Eng;
+  const CFGBlock *Src;
+  ExplodedNode *Pred;
+
+public:
+  CXXTryNodeBuilder(ExplodedNode *pred, const CFGBlock *src, CoreEngine* eng)
+  : Eng(*eng), Src(src), Pred(pred) {}
+
+  const CXXTryStmt *getTry() const {
+    return cast<CXXTryStmt>(Src->getTerminator());
+  }
+
+  void generateNode(const CFGBlock *succ, ProgramStateRef State);
+
+  ProgramStateRef getState() const { return Pred->getState(); }
+
+  const CFGBlock* getSrcBlock() const { return Src; }
+
+  ExplodedNode* getPred() const { return Pred; }
+
+  const LocationContext *getLocationContext() const {
+    return Pred->getLocationContext();
+  }
+
+  CFGBlock* getDefaultSuccessor() {
+    return *Src->succ_begin();
   }
 };
 

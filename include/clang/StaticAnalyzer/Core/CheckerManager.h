@@ -44,6 +44,8 @@ namespace ento {
   struct NodeBuilderContext;
   class MemRegion;
   class SymbolReaper;
+  class Summarizer;
+  typedef std::map<const CheckerBase *, const void *> CheckerSummaries;
 
 template <typename T> class CheckerFn;
 
@@ -299,6 +301,10 @@ public:
                           const Stmt *S, ExprEngine &Eng,
                           const ProgramPoint &PP);
 
+  /// \brief Run checkers for begin of analysis.
+  void runCheckersForBeginAnalysis(ExplodedNode *Pred, ExplodedNodeSet &Dst,
+                                   ExprEngine &Eng);
+
   /// \brief Run checkers for end of analysis.
   void runCheckersForEndAnalysis(ExplodedGraph &G, BugReporter &BR,
                                  ExprEngine &Eng);
@@ -392,6 +398,17 @@ public:
                                          AnalysisManager &mgr,
                                          BugReporter &BR);
 
+  CheckerSummaries runCheckersForEvalSummaryPopulate(ProgramStateRef state);
+
+  void runCheckersForEvalSummaryApply(ExplodedNodeSet &Dst,
+                                      const ExplodedNodeSet &Src,
+                                      ExprEngine &Eng, Summarizer &S,
+                                      const CallEvent &Call,
+                                      CheckerSummaries Data,
+                                      ProgramStateRef CalleeEndState);
+
+  SVal runCheckersForEvalSummarySVal(Summarizer &S, SVal SV);
+
   /// \brief Run checkers for debug-printing a ProgramState.
   ///
   /// Unlike most other callbacks, any checker can simply implement the virtual
@@ -439,6 +456,9 @@ public:
                           const Stmt *S, CheckerContext &)> 
       CheckBindFunc;
   
+  typedef CheckerFn<void (CheckerContext &)>
+      CheckBeginAnalysisFunc;
+  
   typedef CheckerFn<void (ExplodedGraph &, BugReporter &, ExprEngine &)>
       CheckEndAnalysisFunc;
   
@@ -480,6 +500,15 @@ public:
                           AnalysisManager&, BugReporter &)>
       CheckEndOfTranslationUnit;
 
+  typedef CheckerFn<const void *(ProgramStateRef)> EvalSummaryPopulateFunc;
+
+  typedef CheckerFn<void(Summarizer &, const CallEvent &Call,
+                         const void *Summary, CheckerContext &C,
+                         ProgramStateRef CalleeEndState)>
+  EvalSummaryApplyFunc;
+
+  typedef CheckerFn<SVal(Summarizer &, SVal)> EvalSummarySValFunc;
+
   typedef bool (*HandlesStmtFunc)(const Stmt *D);
   void _registerForPreStmt(CheckStmtFunc checkfn,
                            HandlesStmtFunc isForStmtFn);
@@ -495,6 +524,8 @@ public:
   void _registerForLocation(CheckLocationFunc checkfn);
 
   void _registerForBind(CheckBindFunc checkfn);
+
+  void _registerForBeginAnalysis(CheckBeginAnalysisFunc checkfn);
 
   void _registerForEndAnalysis(CheckEndAnalysisFunc checkfn);
 
@@ -518,6 +549,12 @@ public:
   void _registerForEvalCall(EvalCallFunc checkfn);
 
   void _registerForEndOfTranslationUnit(CheckEndOfTranslationUnit checkfn);
+
+  void _registerForEvalSummaryPopulate(EvalSummaryPopulateFunc checkFn);
+
+  void _registerForEvalSummaryApply(EvalSummaryApplyFunc checkFn);
+
+  void _registerForEvalSummarySVal(EvalSummarySValFunc checkFn);
 
 //===----------------------------------------------------------------------===//
 // Internal registration functions for events.
@@ -599,6 +636,8 @@ private:
 
   std::vector<CheckBindFunc> BindCheckers;
 
+  std::vector<CheckBeginAnalysisFunc> BeginAnalysisCheckers;
+
   std::vector<CheckEndAnalysisFunc> EndAnalysisCheckers;
 
   std::vector<CheckEndFunctionFunc> EndFunctionCheckers;
@@ -622,6 +661,10 @@ private:
   std::vector<EvalCallFunc> EvalCallCheckers;
 
   std::vector<CheckEndOfTranslationUnit> EndOfTranslationUnitCheckers;
+
+  std::vector<EvalSummaryPopulateFunc> EvalSummaryPopulateCheckers;
+  std::vector<EvalSummaryApplyFunc> EvalSummaryApplyCheckers;
+  std::vector<EvalSummarySValFunc> EvalSummarySValCheckers;
 
   struct EventInfo {
     SmallVector<CheckEventFunc, 4> Checkers;

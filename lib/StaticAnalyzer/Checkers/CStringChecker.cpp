@@ -18,7 +18,9 @@
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerHelpers.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
@@ -33,8 +35,10 @@ class CStringChecker : public Checker< eval::Call,
                                          check::PreStmt<DeclStmt>,
                                          check::LiveSymbols,
                                          check::DeadSymbols,
-                                         check::RegionChanges
-                                         > {
+                                         check::RegionChanges,
+                                         eval::SummaryPopulate,
+                                         eval::SummaryApply,
+                                         eval::SummarySVal> {
   mutable OwningPtr<BugType> BT_Null,
                              BT_Bounds,
                              BT_Overlap,
@@ -69,6 +73,12 @@ public:
                        ArrayRef<const MemRegion *> ExplicitRegions,
                        ArrayRef<const MemRegion *> Regions,
                        const CallEvent *Call) const;
+
+  const void *evalSummaryPopulate(ProgramStateRef State) const;
+  void evalSummaryApply(Summarizer &S, const CallEvent &Call,
+                        const void *Summary, CheckerContext &C,
+                        ProgramStateRef CalleeEndState) const;
+  SVal evalSummarySVal(Summarizer &S, SVal SV) const;
 
   typedef void (CStringChecker::*FnCheck)(CheckerContext &,
                                           const CallExpr *) const;
@@ -273,7 +283,7 @@ ProgramStateRef CStringChecker::CheckLocation(CheckerContext &C,
   if (!ER)
     return state;
 
-  assert(ER->getValueType() == C.getASTContext().CharTy &&
+  assert(ER->getValueType()->isCharType() &&
     "CheckLocation should only be called with char* ElementRegions");
 
   // Get the size of the array.
@@ -554,7 +564,7 @@ ProgramStateRef CStringChecker::checkAdditionOverflow(CheckerContext &C,
   BasicValueFactory &BVF = svalBuilder.getBasicValueFactory();
 
   QualType sizeTy = svalBuilder.getContext().getSizeType();
-  const llvm::APSInt &maxValInt = BVF.getMaxValue(sizeTy);
+  const llvm::APSInt &maxValInt = BVF.getMaxValue(sizeTy).getInt();
   NonLoc maxVal = svalBuilder.makeIntVal(maxValInt);
 
   SVal maxMinusRight;
@@ -674,10 +684,10 @@ SVal CStringChecker::getCStringLengthForRegion(CheckerContext &C,
     if (Optional<NonLoc> strLn = strLength.getAs<NonLoc>()) {
       // In case of unbounded calls strlen etc bound the range to SIZE_MAX/4
       BasicValueFactory &BVF = svalBuilder.getBasicValueFactory();
-      const llvm::APSInt &maxValInt = BVF.getMaxValue(sizeTy);
+      const llvm::APSInt &maxValInt = BVF.getMaxValue(sizeTy).getInt();
       llvm::APSInt fourInt = APSIntType(maxValInt).getValue(4);
-      const llvm::APSInt *maxLengthInt = BVF.evalAPSInt(BO_Div, maxValInt,
-                                                        fourInt);
+      const llvm::APSInt *maxLengthInt = &BVF.evalAPSInt(BO_Div, maxValInt,
+                                                        fourInt)->getInt();
       NonLoc maxLength = svalBuilder.makeIntVal(*maxLengthInt);
       SVal evalLength = svalBuilder.evalBinOpNN(state, BO_LE, *strLn,
                                                 maxLength, sizeTy);
@@ -1746,7 +1756,7 @@ void CStringChecker::evalStrcmpCommon(CheckerContext &C, const CallExpr *CE,
       SVal lenVal = state->getSVal(lenExpr, LCtx);
 
       // If the length is known, we can get the right substrings.
-      if (const llvm::APSInt *len = svalBuilder.getKnownValue(state, lenVal)) {
+      if (const llvm::APSInt *len = svalBuilder.getKnownIntValue(state, lenVal)) {
         // Create substrings of each to compare the prefix.
         s1StrRef = s1StrRef.substr(0, (size_t)len->getZExtValue());
         s2StrRef = s2StrRef.substr(0, (size_t)len->getZExtValue());
@@ -2055,6 +2065,44 @@ void CStringChecker::checkDeadSymbols(SymbolReaper &SR,
 
   state = state->set<CStringLength>(Entries);
   C.addTransition(state);
+}
+
+
+typedef SummaryMap<const MemRegion *, SVal> SummaryLenMap;
+
+// Summary == Map of all string lengths that are reasoned in this function
+const void *
+CStringChecker::evalSummaryPopulate(ProgramStateRef State) const {
+  CStringLengthTy Lengths = State->get<CStringLength>();
+  SummaryLenMap *Summary = new SummaryLenMap(toMap(Lengths));
+  return Summary;
+}
+
+void CStringChecker::evalSummaryApply(Summarizer &S, const CallEvent &Call,
+                                      const void *Summary,
+                                      CheckerContext &C,
+                                      ProgramStateRef CalleeEndState) const {
+  const SummaryLenMap &Summ = ((const SummaryLenMap *)Summary)->Actualize(S);
+  ProgramStateRef State = Call.getState();
+  for (SummaryLenMap::const_iterator I = Summ.begin(), E = Summ.end(); I != E;
+       ++I) {
+    const MemRegion *MR = I->first;
+    if (MR)
+      State = State->set<CStringLength>(MR, I->second);
+  }
+  C.addTransition(State);
+}
+
+SVal CStringChecker::evalSummarySVal(Summarizer &S, SVal SV) const {
+  const SymbolMetadata *MetaSym =
+      dyn_cast_or_null<SymbolMetadata>(SV.getAsSymbol());
+  if (MetaSym) {
+    const MemRegion *MR = MetaSym->getRegion();
+    const SVal *Len = S.getCall().getState()->get<CStringLength>(MR);
+    if (Len)
+      return *Len;
+  }
+  return SV;
 }
 
 #define REGISTER_CHECKER(name) \

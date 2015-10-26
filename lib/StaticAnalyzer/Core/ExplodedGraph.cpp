@@ -44,13 +44,26 @@ void ExplodedNode::SetAuditor(ExplodedNode::Auditor* A) {
 }
 
 //===----------------------------------------------------------------------===//
+// Statics.
+//===----------------------------------------------------------------------===//
+
+/// BVC - Allocator and context for allocating nodes and their predecessor
+/// and successor groups.
+BumpVectorContext ExplodedGraph::BVC;
+
+/// A list of nodes that can be reused.
+ExplodedGraph::NodeVector ExplodedGraph::FreeNodes;
+
+//===----------------------------------------------------------------------===//
 // Cleanup.
 //===----------------------------------------------------------------------===//
 
 ExplodedGraph::ExplodedGraph()
   : NumNodes(0), ReclaimNodeInterval(0) {}
 
-ExplodedGraph::~ExplodedGraph() {}
+ExplodedGraph::~ExplodedGraph() {
+  collectAllNodes();
+}
 
 //===----------------------------------------------------------------------===//
 // Node reclamation.
@@ -64,7 +77,7 @@ bool ExplodedGraph::isInterestingLValueExpr(const Expr *Ex) {
          isa<ObjCIvarRefExpr>(Ex);
 }
 
-bool ExplodedGraph::shouldCollect(const ExplodedNode *node) {
+bool ExplodedGraph::shouldCollect(const ExplodedNode *node, bool Aggressive) {
   // First, we only consider nodes for reclamation of the following
   // conditions apply:
   //
@@ -97,13 +110,13 @@ bool ExplodedGraph::shouldCollect(const ExplodedNode *node) {
   // Conditions 1 and 2.
   if (node->pred_size() != 1 || node->succ_size() != 1)
     return false;
-
-  const ExplodedNode *pred = *(node->pred_begin());
-  if (pred->succ_size() != 1)
-    return false;
   
   const ExplodedNode *succ = *(node->succ_begin());
   if (succ->pred_size() != 1)
+    return false;
+
+  const ExplodedNode *pred = *(node->pred_begin());
+  if (pred->succ_size() != 1)
     return false;
 
   // Now reclaim any nodes that are (by definition) not essential to
@@ -112,12 +125,24 @@ bool ExplodedGraph::shouldCollect(const ExplodedNode *node) {
   if (progPoint.getAs<PreStmtPurgeDeadSymbols>())
     return !progPoint.getTag();
 
-  // Condition 3.
-  if (!progPoint.getAs<PostStmt>() || progPoint.getAs<PostStore>())
+  if (progPoint.getAs<CallSummaryPostApply>())
     return false;
 
   // Condition 4.
   if (progPoint.getTag())
+    return false;
+
+  // Condition 10.
+  const ProgramPoint SuccLoc = succ->getLocation();
+  if (Optional<StmtPoint> SP = SuccLoc.getAs<StmtPoint>())
+    if (CallEvent::isCallStmt(SP->getStmt()))
+      return false;
+
+  if (Aggressive)
+    return true;
+
+  // Condition 3.
+  if (!progPoint.getAs<PostStmt>() || progPoint.getAs<PostStore>())
     return false;
 
   // Conditions 5, 6, and 7.
@@ -147,12 +172,6 @@ bool ExplodedGraph::shouldCollect(const ExplodedNode *node) {
   if (!PM.isConsumedExpr(Ex))
     return false;
 
-  // Condition 10.
-  const ProgramPoint SuccLoc = succ->getLocation();
-  if (Optional<StmtPoint> SP = SuccLoc.getAs<StmtPoint>())
-    if (CallEvent::isCallStmt(SP->getStmt()))
-      return false;
-
   return true;
 }
 
@@ -170,6 +189,29 @@ void ExplodedGraph::collectNode(ExplodedNode *node) {
   Nodes.RemoveNode(node);
   --NumNodes;
   node->~ExplodedNode();  
+}
+
+void ExplodedGraph::collectAllNodes() {
+  // This function is called only if entire ExplodedGraph is destroyed.
+  // So all the states are released by ~ProgramStateManager
+  // and there is no need to call ExplodedNode dtor explicitly.
+  for (NodeSet::iterator I = Nodes.begin(), E = Nodes.end(); I != E; ++I)
+    FreeNodes.push_back(&*I);
+}
+
+void ExplodedGraph::ReclaimIneffectiveNodes() {
+  NodeVector WL;
+  llvm::errs() << "Before reclaiming: "<< Nodes.size() << "\n";
+  for (NodeSet::iterator I = Nodes.begin(), E = Nodes.end(); I != E; ++I)
+    WL.push_back(&*I);
+  for (NodeVector::iterator I = WL.begin(), E = WL.end(); I != E; ++I) {
+    ExplodedNode *N = *I;
+    if (shouldCollect(N, true))
+      collectNode(N);
+  }
+  ChangedNodes.clear();
+  llvm::errs() << "After reclaiming: "<< Nodes.size() << "\n";
+
 }
 
 void ExplodedGraph::reclaimRecentlyAllocatedNodes() {

@@ -113,7 +113,10 @@ enum IPAKind {
 
   /// Enable inlining of dynamically dispatched methods, bifurcate paths when
   /// exact type info is unavailable.
-  IPAK_DynamicDispatchBifurcate = 5
+  IPAK_DynamicDispatchBifurcate = 5,
+
+  /// Summary-based approach.
+  IPAK_Summary = 6
 };
 
 class AnalyzerOptions : public RefCountedBase<AnalyzerOptions> {
@@ -122,25 +125,27 @@ public:
 
   /// \brief Pair of checker name and enable/disable.
   std::vector<std::pair<std::string, bool> > CheckersControlList;
-  
+
   /// \brief A key-value table of use-specified configuration values.
   ConfigTable Config;
   AnalysisStores AnalysisStoreOpt;
   AnalysisConstraints AnalysisConstraintsOpt;
   AnalysisDiagClients AnalysisDiagOpt;
   AnalysisPurgeMode AnalysisPurgeOpt;
-  
+
   std::string AnalyzeSpecificFunction;
-  
+  typedef llvm::StringMap<llvm::StringMap<llvm::StringRef> > CheckerOptionMap;
+  CheckerOptionMap CheckerSpecificOptions;
+
   /// \brief The maximum number of times the analyzer visits a block.
   unsigned maxBlockVisitOnPath;
-  
-  
+
+
   unsigned ShowCheckerHelp : 1;
   unsigned AnalyzeAll : 1;
   unsigned AnalyzerDisplayProgress : 1;
   unsigned AnalyzeNestedBlocks : 1;
-  
+
   /// \brief The flag regulates if we should eagerly assume evaluations of
   /// conditionals, thus, bifurcating the path.
   ///
@@ -151,20 +156,20 @@ public:
   /// precision until we have a better way to lazily evaluate such logic.  The
   /// downside is that it eagerly bifurcates paths.
   unsigned eagerlyAssumeBinOpBifurcation : 1;
-  
+
   unsigned TrimGraph : 1;
   unsigned visualizeExplodedGraphWithGraphViz : 1;
   unsigned visualizeExplodedGraphWithUbiGraph : 1;
   unsigned UnoptimizedCFG : 1;
   unsigned PrintStats : 1;
-  
+
   /// \brief Do not re-analyze paths leading to exhausted nodes with a different
   /// strategy. We get better code coverage when retry is enabled.
   unsigned NoRetryExhausted : 1;
-  
+
   /// \brief The inlining stack depth limit.
   unsigned InlineMaxStackDepth;
-  
+
   /// \brief The mode of function selection used during inlining.
   AnalysisInliningMode InliningMode;
 
@@ -178,7 +183,7 @@ private:
     UMK_Deep = 2
   };
 
-  /// Controls the high-level analyzer mode, which influences the default 
+  /// Controls the high-level analyzer mode, which influences the default
   /// settings for some of the lower-level config options (such as IPAMode).
   /// \sa getUserMode
   UserModeKind UserMode;
@@ -188,13 +193,13 @@ private:
 
   /// Controls which C++ member functions will be considered for inlining.
   CXXInlineableMemberKind CXXMemberInliningMode;
-  
+
   /// \sa includeTemporaryDtorsInCFG
   Optional<bool> IncludeTemporaryDtorsInCFG;
-  
+
   /// \sa mayInlineCXXStandardLibrary
   Optional<bool> InlineCXXStandardLibrary;
-  
+
   /// \sa mayInlineTemplateFunctions
   Optional<bool> InlineTemplateFunctions;
 
@@ -206,6 +211,9 @@ private:
 
   /// \sa mayInlineObjCMethod
   Optional<bool> ObjCInliningMode;
+
+  /// \sa shouldCollectSummaryStat
+  Optional<bool> CollectSummaryStat;
 
   // Cache of the "ipa-always-inline-size" setting.
   // \sa getAlwaysInlineSize
@@ -360,6 +368,9 @@ public:
   /// in the CFG.
   bool shouldConditionalizeStaticInitializers();
 
+  /// Returns true if counts of nodes procees in summary mode should be printed
+  bool shouldCollectSummaryStat();
+
   // Returns the size of the functions (in basic blocks), which should be
   // considered to be small enough to always inline.
   //
@@ -395,6 +406,12 @@ public:
   /// This is controlled by the 'max-nodes' config option.
   unsigned getMaxNodesPerTopLevelFunction();
 
+  /// Returns selected string option for selected checker
+  /// or default value if this option is not specified
+  const StringRef &getCheckerOption(const StringRef &CheckerName,
+                                    const StringRef &OptionName,
+                                    const StringRef &DefaultValue) const;
+
 public:
   AnalyzerOptions() :
     AnalysisStoreOpt(RegionStoreModel),
@@ -420,9 +437,9 @@ public:
     CXXMemberInliningMode() {}
 
 };
-  
+
 typedef IntrusiveRefCntPtr<AnalyzerOptions> AnalyzerOptionsRef;
-  
+
 }
 
 #endif

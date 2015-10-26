@@ -16,6 +16,7 @@
 
 #include "clang/Analysis/ProgramPoint.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/Optional.h"
@@ -101,7 +102,7 @@ public:
   
   /// Return true if the PathDiagnosticConsumer supports individual
   /// PathDiagnostics that span multiple files.
-  virtual bool supportsCrossFileDiagnostics() const { return false; }
+  virtual bool supportsCrossFileDiagnostics() const { return true; }
 
 protected:
   bool flushed;
@@ -489,6 +490,37 @@ public:
   }
 };
 
+/// \brief Constructs a Stack hint for the given symbol.
+///
+/// The class knows how to construct the stack hint message based on
+/// traversing the CallExpr associated with the call and checking if the given
+/// symbol is returned or is one of the arguments.
+/// The hint can be customized by redefining 'getMessageForX()' methods.
+class StackHintGeneratorForMemRegion : public StackHintGenerator {
+private:
+  const MemRegion *MR;
+  std::string Msg;
+
+public:
+  StackHintGeneratorForMemRegion(const MemRegion *MemR, StringRef M) :
+    MR(MemR), Msg(M) {}
+  virtual ~StackHintGeneratorForMemRegion() {}
+
+  /// \brief Search the call expression for the symbol Sym and dispatch the
+  /// 'getMessageForX()' methods to construct a specific message.
+  virtual std::string getMessage(const ExplodedNode *N);
+
+  /// Produces the message of the following form:
+  ///   'Msg via Nth parameter'
+  virtual std::string getMessageForArg(const Expr *ArgE, unsigned ArgIndex);
+  virtual std::string getMessageForReturn(const CallExpr *CallExpr) {
+    return Msg;
+  }
+  virtual std::string getMessageForSymbolNotFound() {
+    return Msg;
+  }
+};
+
 class PathDiagnosticEventPiece : public PathDiagnosticSpotPiece {
   Optional<bool> IsPrunable;
 
@@ -572,6 +604,7 @@ public:
   const Decl *getCaller() const { return Caller; }
   
   const Decl *getCallee() const { return Callee; }
+  void setCallee(const CallSummaryPreApply &CE, const SourceManager &SM);
   void setCallee(const CallEnter &CE, const SourceManager &SM);
   
   bool hasCallStackMessage() { return !CallStackMessage.empty(); }
@@ -594,7 +627,11 @@ public:
     for (PathPieces::iterator I = path.begin(), 
          E = path.end(); I != E; ++I) (*I)->flattenLocations();
   }
-  
+
+  static PathDiagnosticCallPiece *construct(const ExplodedNode *N,
+                                            const CallSummaryPostApply &CE,
+                                            const SourceManager &SM);
+
   static PathDiagnosticCallPiece *construct(const ExplodedNode *N,
                                             const CallExitEnd &CE,
                                             const SourceManager &SM);

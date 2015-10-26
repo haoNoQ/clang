@@ -20,6 +20,8 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include <deque>
+#include <set>
+#include <clang/StaticAnalyzer/Core/PathSensitive/ExplodedGraph.h>
 
 namespace clang {
 class Decl;
@@ -31,6 +33,8 @@ typedef llvm::DenseSet<const Decl*> SetOfConstDecls;
 class FunctionSummariesTy {
   class FunctionSummary {
   public:
+    uint64_t NodesProceed;
+
     /// Marks the IDs of the basic blocks visited during the analyzes.
     llvm::SmallBitVector VisitedBasicBlocks;
 
@@ -48,6 +52,7 @@ class FunctionSummariesTy {
     unsigned TimesInlined : 32;
 
     FunctionSummary() :
+      NodesProceed(0),
       TotalBasicBlocks(0),
       InlineChecked(0),
       TimesInlined(0) {}
@@ -128,6 +133,21 @@ public:
         return ((I->second.VisitedBasicBlocks.count() * 100) /
                  I->second.TotalBasicBlocks);
     return 0;
+  }
+
+  void addNodeProceed(const Decl *D) {
+    MapTy::iterator I = findOrInsertSummary(D);
+    I->second.NodesProceed++;
+  }
+
+  void addNodesProceed(const Decl *D, uint64_t NodeCount) {
+    MapTy::iterator I = findOrInsertSummary(D);
+    I->second.NodesProceed += NodeCount;
+  }
+
+  uint64_t getNodesCount(const Decl *D) const {
+    MapTy::const_iterator I = Map.find(D);
+    return I != Map.end() ? I->second.NodesProceed : 0;
   }
 
   unsigned getTotalNumBasicBlocks();

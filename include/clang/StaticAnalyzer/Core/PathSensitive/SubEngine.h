@@ -19,6 +19,7 @@
 
 namespace clang {
 
+class CompilerInstance;
 class CFGBlock;
 class CFGElement;
 class LocationContext;
@@ -36,6 +37,7 @@ class BlockCounter;
 class BranchNodeBuilder;
 class IndirectGotoNodeBuilder;
 class SwitchNodeBuilder;
+class CXXTryNodeBuilder;
 class EndOfFunctionNodeBuilder;
 class NodeBuilderWithSinks;
 class MemRegion;
@@ -89,6 +91,10 @@ public:
   /// nodes by processing the 'effects' of a switch statement.
   virtual void processSwitch(SwitchNodeBuilder& builder) = 0;
 
+  /// Called by CoreEngine.  Used to generate successor
+  /// nodes by processing the 'effects' of a try statement.
+  virtual void processCXXTry(CXXTryNodeBuilder& builder) = 0;
+
   /// Called by CoreEngine.  Used to generate end-of-path
   /// nodes when the control reaches the end of a function.
   virtual void processEndOfFunction(NodeBuilderContext& BC,
@@ -139,6 +145,9 @@ public:
   /// printState - Called by ProgramStateManager to print checker-specific data.
   virtual void printState(raw_ostream &Out, ProgramStateRef State,
                           const char *NL, const char *Sep) = 0;
+
+  virtual void processBeginWorklist(ExplodedNode *Pred, ExplodedNodeSet &Dst,
+                                    NodeBuilderContext *Ctx) = 0;
 
   /// Called by CoreEngine when the analysis worklist is either empty or the
   //  maximum number of analysis steps have been reached.

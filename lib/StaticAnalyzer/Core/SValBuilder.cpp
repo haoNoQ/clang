@@ -35,7 +35,10 @@ DefinedOrUnknownSVal SValBuilder::makeZeroVal(QualType type) {
 
   if (type->isIntegralOrEnumerationType())
     return makeIntVal(0, type);
-
+  if (type->isRealFloatingType()) {
+    llvm::APFloat f(0.0);
+    return makeFloatVal(f);
+  }
   // FIXME: Handle floats.
   // FIXME: Handle structs.
   return UnknownVal();
@@ -57,6 +60,24 @@ NonLoc SValBuilder::makeNonLoc(const llvm::APSInt& lhs,
   assert(rhs);
   assert(!Loc::isLocType(type));
   return nonloc::SymbolVal(SymMgr.getIntSymExpr(lhs, op, rhs, type));
+}
+
+NonLoc SValBuilder::makeNonLoc(const SymExpr *lhs, BinaryOperator::Opcode op,
+                                const llvm::APFloat& rhs, QualType type) {
+  // The Environment ensures we always get a persistent APSInt in
+  // BasicValueFactory, so we don't need to get the APSInt from
+  // BasicValueFactory again.
+  assert(lhs);
+  assert(!Loc::isLocType(type));
+  return nonloc::SymbolVal(SymMgr.getSymFloatExpr(lhs, op, rhs, type));
+}
+
+NonLoc SValBuilder::makeNonLoc(const llvm::APFloat& lhs,
+                               BinaryOperator::Opcode op, const SymExpr *rhs,
+                               QualType type) {
+  assert(rhs);
+  assert(!Loc::isLocType(type));
+  return nonloc::SymbolVal(SymMgr.getFloatSymExpr(lhs, op, rhs, type));
 }
 
 NonLoc SValBuilder::makeNonLoc(const SymExpr *lhs, BinaryOperator::Opcode op,
@@ -262,6 +283,9 @@ Optional<SVal> SValBuilder::getConstantVal(const Expr *E) {
   case Stmt::IntegerLiteralClass:
     return makeIntVal(cast<IntegerLiteral>(E));
 
+  case Stmt::FloatingLiteralClass:
+    return makeFloatVal(cast<FloatingLiteral>(E));
+
   case Stmt::ObjCBoolLiteralExprClass:
     return makeBoolVal(cast<ObjCBoolLiteralExpr>(E));
 
@@ -286,10 +310,12 @@ Optional<SVal> SValBuilder::getConstantVal(const Expr *E) {
       return None;
 
     ASTContext &Ctx = getContext();
-    llvm::APSInt Result;
-    if (E->EvaluateAsInt(Result, Ctx))
-      return makeIntVal(Result);
-
+    llvm::APSInt ResultInt;
+    if (E->EvaluateAsInt(ResultInt, Ctx))
+      return makeIntVal(ResultInt);
+    llvm::APFloat ResultFloat(0.0);
+    if (E->EvaluateAsFloat(ResultFloat, Ctx))
+      return makeFloatVal(ResultFloat);
     if (Loc::isLocType(E->getType()))
       if (E->isNullPointerConstant(Ctx, Expr::NPC_ValueDependentIsNotNull))
         return makeNull();
@@ -305,14 +331,16 @@ SVal SValBuilder::makeSymExprValNN(ProgramStateRef State,
                                    BinaryOperator::Opcode Op,
                                    NonLoc LHS, NonLoc RHS,
                                    QualType ResultTy) {
-  if (!State->isTainted(RHS) && !State->isTainted(LHS))
-    return UnknownVal();
-    
   const SymExpr *symLHS = LHS.getAsSymExpr();
   const SymExpr *symRHS = RHS.getAsSymExpr();
+  if (!State->isTainted(RHS) && !State->isTainted(LHS)) {
+    if (symLHS && symRHS && BinaryOperator::isComparisonOp(Op))
+      return makeNonLoc(symLHS, Op, symRHS, ResultTy);
+  }
+    
   // TODO: When the Max Complexity is reached, we should conjure a symbol
   // instead of generating an Unknown value and propagate the taint info to it.
-  const unsigned MaxComp = 10000; // 100000 28X
+  const unsigned MaxComp = 10;
 
   if (symLHS && symRHS &&
       (symLHS->computeComplexity() + symRHS->computeComplexity()) <  MaxComp)
@@ -362,7 +390,7 @@ SVal SValBuilder::evalBinOp(ProgramStateRef state, BinaryOperator::Opcode op,
 DefinedOrUnknownSVal SValBuilder::evalEQ(ProgramStateRef state,
                                          DefinedOrUnknownSVal lhs,
                                          DefinedOrUnknownSVal rhs) {
-  return evalBinOp(state, BO_EQ, lhs, rhs, Context.IntTy)
+  return evalBinOp(state, BO_EQ, lhs, rhs, getConditionType())
       .castAs<DefinedOrUnknownSVal>();
 }
 
@@ -415,7 +443,11 @@ SVal SValBuilder::evalCast(SVal val, QualType castTy, QualType originalTy) {
       BasicValueFactory &BVF = getBasicValueFactory();
       // FIXME: If we had a state here, we could see if the symbol is known to
       // be zero, but we don't.
-      return makeNonLoc(Sym, BO_NE, BVF.getValue(0, Sym->getType()), castTy);
+
+//      if (originalTy->isRealFloatingType())
+//        return makeNonLoc(Sym, BO_NE, BVF.getValue(llvm::APFloat(0.0)).getFloat(), castTy);
+//      else
+        return makeNonLoc(Sym, BO_NE, BVF.getValue(0, Sym->getType()).getInt(), castTy);
     }
     // Loc values are not always true, they could be weakly linked functions.
     if (Optional<Loc> L = val.getAs<Loc>())
@@ -432,8 +464,13 @@ SVal SValBuilder::evalCast(SVal val, QualType castTy, QualType originalTy) {
       return val;
   
   // Check for casts from pointers to integers.
-  if (castTy->isIntegralOrEnumerationType() && Loc::isLocType(originalTy))
+  if (castTy->isIntegralOrEnumerationType() && Loc::isLocType(originalTy)) {
+    // Pointer wrapped in nonloc::SymbolVal
+    if (!val.getAs<Loc>())
+      return nonloc::SymbolVal(
+          SymMgr.getCastSymbol(val.getAsSymbol(), originalTy, castTy));
     return evalCastFromLoc(val.castAs<Loc>(), castTy);
+  }
 
   // Check for casts from integers to pointers.
   if (Loc::isLocType(castTy) && originalTy->isIntegralOrEnumerationType()) {
