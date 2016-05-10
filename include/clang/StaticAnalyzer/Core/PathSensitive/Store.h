@@ -203,6 +203,10 @@ public:
   virtual bool scanReachableSymbols(Store S, const MemRegion *R,
                                     ScanReachableSymbols &Visitor) = 0;
 
+  /// Returns true if contents of the region had or might have possibly changed
+  /// since the beginning of the analysis.
+  virtual bool hasAnyBinding(Store S, const MemRegion *R) = 0;
+
   virtual void print(Store store, raw_ostream &Out,
                      const char* nl, const char *sep) = 0;
 

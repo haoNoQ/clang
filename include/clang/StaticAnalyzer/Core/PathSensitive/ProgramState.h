@@ -234,6 +234,14 @@ public:
 
   ProgramStateRef bindLoc(SVal location, SVal V) const;
 
+  // Sets the smart trait value for the symbol.
+  ProgramStateRef bindLoc(const SmartStateTrait &Trait, SymbolRef Sym,
+                          SVal Val) const;
+  // Sets the smart trait value for the symbol - a convenient override when
+  // the trait has an integer type or an enumeration type.
+  ProgramStateRef bindLoc(const SmartStateTrait &Trait, SymbolRef Sym,
+                          uint64_t Val) const;
+
   ProgramStateRef bindDefault(SVal loc, SVal V) const;
 
   ProgramStateRef killBinding(Loc LV) const;
@@ -293,6 +301,16 @@ public:
   /// Get the lvalue for an array index.
   SVal getLValue(QualType ElementType, SVal Idx, SVal Base) const;
 
+  /// Returns true if contents of the region had or might have possibly changed
+  /// since the beginning of the analysis.
+  bool hasAnyBinding(const MemRegion *R) const;
+
+  /// Returns true if the value of the smart trait for the symbol had or might
+  /// have possibly changed since the beginning of the analysis. This
+  /// essentially indicates that the symbol is possibly of interest to the
+  /// checker that models the trait.
+  bool hasAnyBinding(const SmartStateTrait &Trait, SymbolRef Sym) const;
+
   /// Returns the SVal bound to the statement 'S' in the state's environment.
   SVal getSVal(const Stmt *S, const LocationContext *LCtx) const;
   
@@ -310,7 +328,11 @@ public:
   SVal getSVal(const MemRegion* R) const;
 
   SVal getSValAsScalarOrLoc(const MemRegion *R) const;
-  
+
+  /// Returns the SVal that corresponds to the given smart trait of the symbol.
+  SVal getSVal(const SmartStateTrait &Trait, SymbolRef Sym) const;
+
+
   /// \brief Visits the symbols reachable from the given SVal using the provided
   /// SymbolVisitor.
   ///
@@ -690,6 +712,23 @@ inline ProgramStateRef ProgramState::bindLoc(SVal LV, SVal V) const {
   return this;
 }
 
+inline ProgramStateRef ProgramState::bindLoc(const SmartStateTrait &Trait,
+                                             SymbolRef Sym,
+                                             SVal Val) const {
+  MemRegionManager &MemMgr = getStateManager().getRegionManager();
+  const MemRegion *MR = MemMgr.getGhostSymbolicRegion(Trait, Sym);
+  return bindLoc(loc::MemRegionVal(MR), Val, false);
+}
+
+inline ProgramStateRef ProgramState::bindLoc(const SmartStateTrait &Trait,
+                                             SymbolRef Sym,
+                                             uint64_t Val) const {
+  SValBuilder &SVB = getStateManager().getSValBuilder();
+  QualType T = Trait.getTraitType();
+  assert(T->isIntegralOrEnumerationType());
+  return bindLoc(Trait, Sym, SVB.makeIntVal(Val, T));
+}
+
 inline Loc ProgramState::getLValue(const VarDecl *VD,
                                const LocationContext *LC) const {
   return getStateManager().StoreMgr->getLValueVar(VD, LC);
@@ -724,6 +763,16 @@ inline SVal ProgramState::getLValue(QualType ElementType, SVal Idx, SVal Base) c
   return UnknownVal();
 }
 
+inline bool ProgramState::hasAnyBinding(const MemRegion *R) const {
+  return getStateManager().StoreMgr->hasAnyBinding(getStore(), R);
+}
+
+inline bool ProgramState::hasAnyBinding(const SmartStateTrait &Trait, SymbolRef Sym) const {
+  MemRegionManager &MemMgr = getStateManager().getRegionManager();
+  const MemRegion *MR = MemMgr.getGhostSymbolicRegion(Trait, Sym);
+  return hasAnyBinding(MR);
+}
+
 inline SVal ProgramState::getSVal(const Stmt *Ex,
                                   const LocationContext *LCtx) const{
   return Env.getSVal(EnvironmentEntry(Ex, LCtx),
@@ -750,6 +799,13 @@ inline SVal ProgramState::getRawSVal(Loc LV, QualType T) const {
 inline SVal ProgramState::getSVal(const MemRegion* R) const {
   return getStateManager().StoreMgr->getBinding(getStore(),
                                                 loc::MemRegionVal(R));
+}
+
+inline SVal ProgramState::getSVal(const SmartStateTrait &Trait,
+                                  SymbolRef Sym) const {
+  MemRegionManager &MemMgr = getStateManager().getRegionManager();
+  const MemRegion *MR = MemMgr.getGhostSymbolicRegion(Trait, Sym);
+  return getSVal(MR);
 }
 
 inline BasicValueFactory &ProgramState::getBasicVals() const {

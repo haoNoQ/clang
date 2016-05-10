@@ -427,6 +427,9 @@ bool SymbolReaper::isLiveRegion(const MemRegion *MR) {
   if (const SymbolicRegion *SR = dyn_cast<SymbolicRegion>(MR))
     return isLive(SR->getSymbol());
 
+  if (const GhostSymbolicRegion *GSR = dyn_cast<GhostSymbolicRegion>(MR))
+    return isLive(GSR->getSymbol());
+
   if (const VarRegion *VR = dyn_cast<VarRegion>(MR))
     return isLive(VR, true);
 

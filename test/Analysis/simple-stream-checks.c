@@ -1,4 +1,5 @@
-// RUN: %clang_cc1 -analyze -analyzer-checker=core,alpha.unix.SimpleStream -verify %s
+// RUN: %clang_cc1 -analyze -analyzer-checker=core,alpha.unix.SimpleStream   -DFIXIT_V1 -verify %s
+// RUN: %clang_cc1 -analyze -analyzer-checker=core,alpha.unix.SimpleStreamV2 -DFIXIT_V2 -verify %s
 
 #include "Inputs/system-header-simulator-for-simple-stream.h"
 
@@ -89,3 +90,10 @@ void testPassToSystemHeaderFunctionIndirectly() {
   fs.p = fopen("myfile.txt", "w");
   fakeSystemHeaderCall(&fs); // invalidates fs, making fs.p unreachable
 }  // no-warning
+
+#ifndef FIXIT_V1
+void testOverwrite() {
+  FILE *F = fopen("myfile.txt", "w");
+  F = 0;
+} // expected-warning{{Opened file is never closed; potential resource leak}}
+#endif

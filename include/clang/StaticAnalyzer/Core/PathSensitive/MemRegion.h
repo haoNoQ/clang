@@ -382,7 +382,6 @@ public:
   }
 };
 
-
 /// SubRegion - A region that subsets another larger region.  Most regions
 ///  are subclasses of SubRegion.
 class SubRegion : public MemRegion {
@@ -1089,6 +1088,97 @@ const RegionTy* MemRegion::getAs() const {
 }
 
 //===----------------------------------------------------------------------===//
+// Ghost object regions.
+//===----------------------------------------------------------------------===//
+
+class SmartStateTrait {
+  std::string Desc;
+  QualType Ty;
+#ifndef NDEBUG
+  bool Initialized;
+#endif
+
+public:
+#ifndef NDEBUG
+  SmartStateTrait() : Initialized(false) {}
+#endif
+
+  void initialize(const std::string &D, QualType T) {
+    assert(!Initialized);
+#ifndef NDEBUG
+    Initialized = true;
+#endif
+    Desc = D;
+    Ty = T;
+  }
+
+  typedef uintptr_t IdTy;
+  IdTy getTraitID() const {
+    assert(Initialized);
+    return reinterpret_cast<uintptr_t>(this);
+  }
+
+  const std::string &getTraitDescription() const {
+    assert(Initialized);
+    return Desc;
+  }
+  QualType getTraitType() const {
+    assert(Initialized);
+    return Ty;
+  }
+};
+
+class GhostSpaceRegion : public MemSpaceRegion {
+  virtual void anchor();
+  friend class MemRegionManager;
+  const SmartStateTrait &Trait;
+  GhostSpaceRegion(MemRegionManager *mgr, const SmartStateTrait &Trait)
+      : MemSpaceRegion(mgr, GhostSpaceRegionKind), Trait(Trait) {}
+
+public:
+
+  void Profile(llvm::FoldingSetNodeID &ID) const override;
+  void dumpToStream(raw_ostream &os) const override;
+
+  const SmartStateTrait &getTrait() const { return Trait; }
+
+  static bool classof(const MemRegion *R) {
+    return R->getKind() == GhostSpaceRegionKind;
+  }
+};
+
+class GhostSymbolicRegion : public TypedValueRegion {
+  friend class MemRegionManager;
+
+  const SymbolRef Sym;
+
+  GhostSymbolicRegion(SymbolRef Sym, const MemRegion *SReg)
+      : TypedValueRegion(SReg, GhostSymbolicRegionKind), Sym(Sym) {}
+
+public:
+  const SmartStateTrait &getTrait() const {
+    return cast<GhostSpaceRegion>(getSuperRegion())->getTrait();
+  }
+  SymbolRef getSymbol() const { return Sym; }
+
+  virtual bool isBoundable() const override { return false; }
+
+  QualType getValueType() const override { return getTrait().getTraitType(); }
+
+  void Profile(llvm::FoldingSetNodeID &ID) const override;
+
+  static void ProfileRegion(llvm::FoldingSetNodeID &ID,
+                            SymbolRef Sym,
+                            const MemRegion* superRegion);
+
+  void dumpToStream(raw_ostream &os) const override;
+
+  static bool classof(const MemRegion* R) {
+    return R->getKind() == GhostSymbolicRegionKind;
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // MemRegionManager - Factory object for creating regions.
 //===----------------------------------------------------------------------===//
 
@@ -1108,6 +1198,8 @@ class MemRegionManager {
     StackArgumentsSpaceRegions;
   llvm::DenseMap<const CodeTextRegion *, StaticGlobalSpaceRegion *>
     StaticsGlobalSpaceRegions;
+  llvm::DenseMap<SmartStateTrait::IdTy, GhostSpaceRegion *>
+    GhostSpaceRegions;
 
   HeapSpaceRegion *heap;
   UnknownSpaceRegion *unknown;
@@ -1150,6 +1242,8 @@ public:
   const UnknownSpaceRegion *getUnknownRegion();
 
   const CodeSpaceRegion *getCodeRegion();
+
+  const GhostSpaceRegion *getGhostSpaceRegion(const SmartStateTrait &Trait);
 
   /// getAllocaRegion - Retrieve a region associated with a call to alloca().
   const AllocaRegion *getAllocaRegion(const Expr *Ex, unsigned Cnt,
@@ -1253,29 +1347,32 @@ public:
   /// super-region used.
   const CXXTempObjectRegion *getCXXStaticTempObjectRegion(const Expr *Ex);
 
+  const GhostSymbolicRegion *
+  getGhostSymbolicRegion(const SmartStateTrait &Trait, SymbolRef Sym);
+
 private:
   template <typename RegionTy, typename A1>
-  RegionTy* getRegion(const A1 a1);
+  RegionTy* getRegion(const A1 &a1);
 
   template <typename RegionTy, typename A1>
-  RegionTy* getSubRegion(const A1 a1, const MemRegion* superRegion);
+  RegionTy* getSubRegion(const A1 &a1, const MemRegion* superRegion);
 
   template <typename RegionTy, typename A1, typename A2>
-  RegionTy* getRegion(const A1 a1, const A2 a2);
+  RegionTy* getRegion(const A1 &a1, const A2 &a2);
 
   template <typename RegionTy, typename A1, typename A2>
-  RegionTy* getSubRegion(const A1 a1, const A2 a2,
+  RegionTy* getSubRegion(const A1 &a1, const A2 &a2,
                          const MemRegion* superRegion);
 
   template <typename RegionTy, typename A1, typename A2, typename A3>
-  RegionTy* getSubRegion(const A1 a1, const A2 a2, const A3 a3,
+  RegionTy* getSubRegion(const A1 &a1, const A2 &a2, const A3 &a3,
                          const MemRegion* superRegion);
   
   template <typename REG>
   const REG* LazyAllocate(REG*& region);
   
   template <typename REG, typename ARG>
-  const REG* LazyAllocate(REG*& region, ARG a);
+  const REG* LazyAllocate(REG*& region, const ARG &a);
 };
 
 //===----------------------------------------------------------------------===//

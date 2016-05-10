@@ -108,7 +108,8 @@ const MemRegion *StoreManager::castRegion(const MemRegion *R, QualType CastToTy)
     case MemRegion::StaticGlobalSpaceRegionKind:
     case MemRegion::GlobalInternalSpaceRegionKind:
     case MemRegion::GlobalSystemSpaceRegionKind:
-    case MemRegion::GlobalImmutableSpaceRegionKind: {
+    case MemRegion::GlobalImmutableSpaceRegionKind:
+    case MemRegion::GhostSpaceRegionKind: {
       llvm_unreachable("Invalid region cast");
     }
 
@@ -126,6 +127,7 @@ const MemRegion *StoreManager::castRegion(const MemRegion *R, QualType CastToTy)
     case MemRegion::VarRegionKind:
     case MemRegion::CXXTempObjectRegionKind:
     case MemRegion::CXXBaseObjectRegionKind:
+    case MemRegion::GhostSymbolicRegionKind:
       return MakeElementRegion(R, PointeeTy);
 
     case MemRegion::ElementRegionKind: {

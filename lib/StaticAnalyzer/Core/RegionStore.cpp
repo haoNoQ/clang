@@ -395,6 +395,8 @@ public:
   bool scanReachableSymbols(Store S, const MemRegion *R,
                             ScanReachableSymbols &Callbacks) override;
 
+  bool hasAnyBinding(Store S, const MemRegion *R) override;
+
   RegionBindingsRef removeSubRegionBindings(RegionBindingsConstRef B,
                                             const SubRegion *R);
 
@@ -743,6 +745,67 @@ bool RegionStoreManager::scanReachableSymbols(Store S, const MemRegion *R,
   }
 
   return true;
+}
+
+bool RegionStoreManager::hasAnyBinding(Store S, const MemRegion *R) {
+  RegionBindingsRef B = getRegionBindings(S);
+
+  const MemRegion *BaseR = R->getBaseRegion();
+  const MemSpaceRegion *SpaceR = BaseR->getMemorySpace();
+
+  if (B.lookup(SpaceR))
+    return true; // The whole memory space has been wiped?
+
+  const ClusterBindings *Cluster = B.lookup(BaseR);
+  if (!Cluster) // No memory space wipes, no cluster bindings?
+    return false;
+  else if (BaseR == R) // Fast path for base regions.
+    return true;
+
+  RegionOffset RO = R->getAsOffset();
+  // If we are not certain of the offset, then any binding, which definitely
+  // exists in the cluster, may actually be inside R, so we stay careful.
+  // FIXME: Take constraints on symbols into account.
+  if (!RO.isValid() || RO.hasSymbolicOffset())
+    return true;
+
+  // The slowest path - for sub-regions.
+  int64_t Extent = -1; // "-1" represents symbolic extent.
+
+  // By now we are certain that R is not only a SubRegion,
+  // but also a non-base-region.
+  SVal ExtentVal = cast<SubRegion>(R)->getExtent(svalBuilder);
+  if (auto ConcreteExtentVal = ExtentVal.getAs<nonloc::ConcreteInt>())
+    Extent = ConcreteExtentVal->getValue().getSExtValue();
+
+  int64_t LeftEdge = RO.getOffset();
+  int64_t RightEdge = LeftEdge + Extent; // Not used in case of symbolic extent.
+
+  for (auto I = Cluster->begin(), E = Cluster->end(); I != E; ++I) {
+    const BindingKey &Key = I.getKey();
+
+    // FIXME: Take constraints on symbols into account.
+    if (Key.hasSymbolicOffset())
+      return true;
+
+    int64_t Offset = Key.getOffset();
+    if (Extent == -1) { // Symbolic offset?
+      if (Offset >= LeftEdge)
+        return true;
+    } else {
+      // FIXME: Essentially every binding is a segment, not a point.
+      // However, currently BindingKey does not store the size
+      // of this segment, only its left edge - the 'Offset'.
+      // Because this makes us skip cases of changed regions,
+      // which violates the contract of this method (say true if unsure),
+      // maybe throw away the whole loop and just return true
+      // whenever the cluster is non-empty?
+      if (Offset >= LeftEdge && Offset < RightEdge)
+        return true;
+    }
+  }
+  // All bindings in the cluster are outside R.
+  return false;
 }
 
 static inline bool isUnionField(const FieldRegion *FR) {
@@ -2271,7 +2334,7 @@ RegionStoreManager::bindAggregate(RegionBindingsConstRef B,
 namespace {
 class removeDeadBindingsWorker :
   public ClusterAnalysis<removeDeadBindingsWorker> {
-  SmallVector<const SymbolicRegion*, 12> Postponed;
+  SmallVector<const MemRegion*, 12> Postponed;
   SymbolReaper &SymReaper;
   const StackFrameContext *CurrentLCtx;
 
@@ -2321,6 +2384,15 @@ void removeDeadBindingsWorker::VisitAddedToCluster(const MemRegion *baseR,
     return;
   }
 
+  if (const GhostSymbolicRegion *GSR = dyn_cast<GhostSymbolicRegion>(baseR)) {
+    if (SymReaper.isLive(GSR->getSymbol()))
+      AddToWorkList(GSR, &C);
+    else
+      Postponed.push_back(GSR);
+
+    return;
+  }
+
   if (isa<NonStaticGlobalSpaceRegion>(baseR)) {
     AddToWorkList(baseR, &C);
     return;
@@ -2346,6 +2418,8 @@ void removeDeadBindingsWorker::VisitCluster(const MemRegion *baseR,
   // This means we should continue to track that symbol.
   if (const SymbolicRegion *SymR = dyn_cast<SymbolicRegion>(baseR))
     SymReaper.markLive(SymR->getSymbol());
+  if (const GhostSymbolicRegion *GSymR = dyn_cast<GhostSymbolicRegion>(baseR))
+    SymReaper.markLive(GSymR->getSymbol());
 
   for (ClusterBindings::iterator I = C->begin(), E = C->end(); I != E; ++I) {
     // Element index of a binding key is live.
@@ -2396,11 +2470,16 @@ bool removeDeadBindingsWorker::UpdatePostponed() {
   // having done a scan.
   bool changed = false;
 
-  for (SmallVectorImpl<const SymbolicRegion*>::iterator
+  for (SmallVectorImpl<const MemRegion*>::iterator
         I = Postponed.begin(), E = Postponed.end() ; I != E ; ++I) {
-    if (const SymbolicRegion *SR = *I) {
+    if (const auto *SR = dyn_cast_or_null<SymbolicRegion>(*I)) {
       if (SymReaper.isLive(SR->getSymbol())) {
         changed |= AddToWorkList(SR);
+        *I = nullptr;
+      }
+    } else if (const auto *GSR = dyn_cast_or_null<GhostSymbolicRegion>(*I)) {
+      if (SymReaper.isLive(GSR->getSymbol())) {
+        changed |= AddToWorkList(GSR);
         *I = nullptr;
       }
     }
@@ -2439,6 +2518,8 @@ StoreRef RegionStoreManager::removeDeadBindings(Store store,
 
     if (const SymbolicRegion *SymR = dyn_cast<SymbolicRegion>(Base))
       SymReaper.maybeDead(SymR->getSymbol());
+    if (const GhostSymbolicRegion *GSymR = dyn_cast<GhostSymbolicRegion>(Base))
+      SymReaper.maybeDead(GSymR->getSymbol());
 
     // Mark all non-live symbols that this binding references as dead.
     const ClusterBindings &Cluster = I.getData();

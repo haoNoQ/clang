@@ -34,7 +34,7 @@ using namespace ento;
 template<typename RegionTy> struct MemRegionManagerTrait;
 
 template <typename RegionTy, typename A1>
-RegionTy* MemRegionManager::getRegion(const A1 a1) {
+RegionTy* MemRegionManager::getRegion(const A1 &a1) {
   const typename MemRegionManagerTrait<RegionTy>::SuperRegionTy *superRegion =
   MemRegionManagerTrait<RegionTy>::getSuperRegion(*this, a1);
 
@@ -54,7 +54,7 @@ RegionTy* MemRegionManager::getRegion(const A1 a1) {
 }
 
 template <typename RegionTy, typename A1>
-RegionTy* MemRegionManager::getSubRegion(const A1 a1,
+RegionTy *MemRegionManager::getSubRegion(const A1 &a1,
                                          const MemRegion *superRegion) {
   llvm::FoldingSetNodeID ID;
   RegionTy::ProfileRegion(ID, a1, superRegion);
@@ -72,7 +72,7 @@ RegionTy* MemRegionManager::getSubRegion(const A1 a1,
 }
 
 template <typename RegionTy, typename A1, typename A2>
-RegionTy* MemRegionManager::getRegion(const A1 a1, const A2 a2) {
+RegionTy* MemRegionManager::getRegion(const A1 &a1, const A2 &a2) {
   const typename MemRegionManagerTrait<RegionTy>::SuperRegionTy *superRegion =
   MemRegionManagerTrait<RegionTy>::getSuperRegion(*this, a1, a2);
 
@@ -92,7 +92,7 @@ RegionTy* MemRegionManager::getRegion(const A1 a1, const A2 a2) {
 }
 
 template <typename RegionTy, typename A1, typename A2>
-RegionTy* MemRegionManager::getSubRegion(const A1 a1, const A2 a2,
+RegionTy *MemRegionManager::getSubRegion(const A1 &a1, const A2 &a2,
                                          const MemRegion *superRegion) {
   llvm::FoldingSetNodeID ID;
   RegionTy::ProfileRegion(ID, a1, a2, superRegion);
@@ -110,7 +110,8 @@ RegionTy* MemRegionManager::getSubRegion(const A1 a1, const A2 a2,
 }
 
 template <typename RegionTy, typename A1, typename A2, typename A3>
-RegionTy* MemRegionManager::getSubRegion(const A1 a1, const A2 a2, const A3 a3,
+RegionTy *MemRegionManager::getSubRegion(const A1 &a1, const A2 &a2,
+                                         const A3 &a3,
                                          const MemRegion *superRegion) {
   llvm::FoldingSetNodeID ID;
   RegionTy::ProfileRegion(ID, a1, a2, a3, superRegion);
@@ -253,6 +254,11 @@ void StackSpaceRegion::Profile(llvm::FoldingSetNodeID &ID) const {
 void StaticGlobalSpaceRegion::Profile(llvm::FoldingSetNodeID &ID) const {
   ID.AddInteger(static_cast<unsigned>(getKind()));
   ID.AddPointer(getCodeRegion());
+}
+
+void GhostSpaceRegion::Profile(llvm::FoldingSetNodeID &ID) const {
+  ID.AddInteger(static_cast<unsigned>(getKind()));
+  ID.AddInteger(getTrait().getTraitID());
 }
 
 void StringRegion::ProfileRegion(llvm::FoldingSetNodeID& ID,
@@ -416,6 +422,17 @@ void CXXBaseObjectRegion::Profile(llvm::FoldingSetNodeID &ID) const {
   ProfileRegion(ID, getDecl(), isVirtual(), superRegion);
 }
 
+void GhostSymbolicRegion::ProfileRegion(llvm::FoldingSetNodeID &ID,
+                                        SymbolRef Sym, const MemRegion *SReg) {
+  ID.AddInteger(GhostSymbolicRegionKind);
+  ID.AddPointer(Sym);
+  ID.AddPointer(SReg);
+}
+
+void GhostSymbolicRegion::Profile(llvm::FoldingSetNodeID &ID) const {
+  ProfileRegion(ID, Sym, getSuperRegion());
+}
+
 //===----------------------------------------------------------------------===//
 // Region anchors.
 //===----------------------------------------------------------------------===//
@@ -428,6 +445,7 @@ void StackArgumentsSpaceRegion::anchor() { }
 void TypedRegion::anchor() { }
 void TypedValueRegion::anchor() { }
 void CodeTextRegion::anchor() { }
+void GhostSpaceRegion::anchor() { }
 void SubRegion::anchor() { }
 
 //===----------------------------------------------------------------------===//
@@ -521,6 +539,10 @@ void VarRegion::dumpToStream(raw_ostream &os) const {
   os << *cast<VarDecl>(D);
 }
 
+void GhostSymbolicRegion::dumpToStream(raw_ostream &os) const {
+  os << getTrait().getTraitDescription() << '{' << Sym << '}';
+}
+
 LLVM_DUMP_METHOD void RegionRawOffset::dump() const {
   dumpToStream(llvm::errs());
 }
@@ -563,6 +585,10 @@ void StackArgumentsSpaceRegion::dumpToStream(raw_ostream &os) const {
 
 void StackLocalsSpaceRegion::dumpToStream(raw_ostream &os) const {
   os << "StackLocalsSpaceRegion";
+}
+
+void GhostSpaceRegion::dumpToStream(raw_ostream &os) const {
+  os << "GhostSpaceRegion{" << getTrait().getTraitDescription() << '}';
 }
 
 bool MemRegion::canPrintPretty() const {
@@ -647,7 +673,7 @@ const REG *MemRegionManager::LazyAllocate(REG*& region) {
 }
 
 template <typename REG, typename ARG>
-const REG *MemRegionManager::LazyAllocate(REG*& region, ARG a) {
+const REG *MemRegionManager::LazyAllocate(REG*& region, const ARG &a) {
   if (!region) {
     region = A.Allocate<REG>();
     new (region) REG(this, a);
@@ -714,6 +740,18 @@ const UnknownSpaceRegion *MemRegionManager::getUnknownRegion() {
 
 const CodeSpaceRegion *MemRegionManager::getCodeRegion() {
   return LazyAllocate(code);
+}
+
+const GhostSpaceRegion *
+MemRegionManager::getGhostSpaceRegion(const SmartStateTrait &Trait) {
+  GhostSpaceRegion *&R = GhostSpaceRegions[Trait.getTraitID()];
+
+  if (R)
+    return R;
+
+  R = A.Allocate<GhostSpaceRegion>();
+  new (R) GhostSpaceRegion(this, Trait);
+  return R;
 }
 
 //===----------------------------------------------------------------------===//
@@ -880,6 +918,12 @@ const CXXTempObjectRegion *
 MemRegionManager::getCXXStaticTempObjectRegion(const Expr *Ex) {
   return getSubRegion<CXXTempObjectRegion>(
       Ex, getGlobalsRegion(MemRegion::GlobalInternalSpaceRegionKind, nullptr));
+}
+
+const GhostSymbolicRegion *
+MemRegionManager::getGhostSymbolicRegion(const SmartStateTrait &Trait,
+                                         SymbolRef Sym) {
+  return getSubRegion<GhostSymbolicRegion>(Sym, getGhostSpaceRegion(Trait));
 }
 
 const CompoundLiteralRegion*
@@ -1200,6 +1244,7 @@ RegionOffset MemRegion::getAsOffset() const {
     case GlobalInternalSpaceRegionKind:
     case GlobalSystemSpaceRegionKind:
     case GlobalImmutableSpaceRegionKind:
+    case GhostSpaceRegionKind:
       // Stores can bind directly to a region space to set a default value.
       assert(Offset == 0 && !SymbolicOffsetBase);
       goto Finish;
@@ -1221,6 +1266,7 @@ RegionOffset MemRegion::getAsOffset() const {
     case ObjCStringRegionKind:
     case VarRegionKind:
     case CXXTempObjectRegionKind:
+    case GhostSymbolicRegionKind:
       // Usual base regions.
       goto Finish;
 

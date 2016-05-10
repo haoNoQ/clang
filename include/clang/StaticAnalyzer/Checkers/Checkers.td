@@ -400,6 +400,10 @@ def SimpleStreamChecker : Checker<"SimpleStream">,
   HelpText<"Check for misuses of stream APIs">,
   DescFile<"SimpleStreamChecker.cpp">;
 
+def SimpleStreamCheckerV2 : Checker<"SimpleStreamV2">,
+  HelpText<"Check for misuses of stream APIs - with ghost symbolic regions">,
+  DescFile<"SimpleStreamCheckerV2.cpp">;
+
 } // end "alpha.unix"
 
 let ParentPackage = CString in {
