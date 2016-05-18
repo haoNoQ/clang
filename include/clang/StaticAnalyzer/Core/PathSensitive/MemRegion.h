@@ -1147,6 +1147,34 @@ public:
   }
 };
 
+class GhostFieldRegion : public TypedValueRegion {
+  friend class MemRegionManager;
+
+  const SmartStateTrait &Trait;
+
+  GhostFieldRegion(const SmartStateTrait &Trait, const MemRegion *SReg)
+      : TypedValueRegion(SReg, GhostFieldRegionKind), Trait(Trait) {}
+
+public:
+  const SmartStateTrait &getTrait() const { return Trait; }
+
+  virtual bool isBoundable() const override { return true; }
+
+  QualType getValueType() const override { return getTrait().getTraitType(); }
+
+  void Profile(llvm::FoldingSetNodeID &ID) const override;
+
+  static void ProfileRegion(llvm::FoldingSetNodeID &ID,
+                            const SmartStateTrait &Trait,
+                            const MemRegion *SuperRegion);
+
+  void dumpToStream(raw_ostream &os) const override;
+
+  static bool classof(const MemRegion *R) {
+    return R->getKind() == GhostFieldRegionKind;
+  }
+};
+
 class GhostSymbolicRegion : public TypedValueRegion {
   friend class MemRegionManager;
 
@@ -1346,6 +1374,9 @@ public:
   /// by static references. This differs from getCXXTempObjectRegion in the
   /// super-region used.
   const CXXTempObjectRegion *getCXXStaticTempObjectRegion(const Expr *Ex);
+
+  const GhostFieldRegion *getGhostFieldRegion(const SmartStateTrait &Trait,
+                                              const MemRegion *superRegion);
 
   const GhostSymbolicRegion *
   getGhostSymbolicRegion(const SmartStateTrait &Trait, SymbolRef Sym);

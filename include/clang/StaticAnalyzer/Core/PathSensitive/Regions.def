@@ -80,6 +80,7 @@ ABSTRACT_REGION(SubRegion, MemRegion)
       REGION(ElementRegion, TypedValueRegion)
       REGION(ObjCStringRegion, TypedValueRegion)
       REGION(StringRegion, TypedValueRegion)
+      REGION(GhostFieldRegion, TypedValueRegion)
       REGION(GhostSymbolicRegion, TypedValueRegion)
       REGION_RANGE(TYPED_VALUE_REGIONS, CompoundLiteralRegionKind,
                                         GhostSymbolicRegionKind)

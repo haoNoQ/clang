@@ -1,5 +1,6 @@
 // RUN: %clang_cc1 -analyze -analyzer-checker=core,alpha.unix.SimpleStream   -DFIXIT_V1 -verify %s
 // RUN: %clang_cc1 -analyze -analyzer-checker=core,alpha.unix.SimpleStreamV2 -DFIXIT_V2 -verify %s
+// RUN: %clang_cc1 -analyze -analyzer-checker=core,alpha.unix.SimpleStreamV3 -DFIXIT_V3 -verify %s
 
 #include "Inputs/system-header-simulator-for-simple-stream.h"
 
@@ -15,6 +16,7 @@ void checkDoubleFClose(int *Data) {
   }
 }
 
+#ifndef FIXIT_V3
 int checkLeak(int *Data) {
   FILE *F = fopen("myfile.txt", "w");
   if (F != 0) {
@@ -26,6 +28,7 @@ int checkLeak(int *Data) {
   else
     return 0;
 }
+#endif
 
 void checkLeakFollowedByAssert(int *Data) {
   FILE *F = fopen("myfile.txt", "w");
@@ -72,11 +75,13 @@ void SymbolEscapedThroughAssignmentToGloabl() {
   return; // no warning
 }
 
+#ifndef FIXIT_V3
 void SymbolDoesNotEscapeThoughStringAPIs(char *Data) {
   FILE *F = fopen("myfile.txt", "w");
   fputc(*Data, F);
   return; // expected-warning {{Opened file is never closed; potential resource leak}}
 }
+#endif
 
 void passConstPointer(const FILE * F);
 void testPassConstPointer() {

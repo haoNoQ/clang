@@ -422,6 +422,18 @@ void CXXBaseObjectRegion::Profile(llvm::FoldingSetNodeID &ID) const {
   ProfileRegion(ID, getDecl(), isVirtual(), superRegion);
 }
 
+void GhostFieldRegion::ProfileRegion(llvm::FoldingSetNodeID &ID,
+                                     const SmartStateTrait &Trait,
+                                     const MemRegion *SReg) {
+  ID.AddInteger(GhostFieldRegionKind);
+  ID.AddInteger(Trait.getTraitID());
+  ID.AddPointer(SReg);
+}
+
+void GhostFieldRegion::Profile(llvm::FoldingSetNodeID &ID) const {
+  ProfileRegion(ID, Trait, getSuperRegion());
+}
+
 void GhostSymbolicRegion::ProfileRegion(llvm::FoldingSetNodeID &ID,
                                         SymbolRef Sym, const MemRegion *SReg) {
   ID.AddInteger(GhostSymbolicRegionKind);
@@ -537,6 +549,10 @@ void SymbolicRegion::dumpToStream(raw_ostream &os) const {
 
 void VarRegion::dumpToStream(raw_ostream &os) const {
   os << *cast<VarDecl>(D);
+}
+
+void GhostFieldRegion::dumpToStream(raw_ostream &os) const {
+  os << getTrait().getTraitDescription() << '{' << getSuperRegion() << '}';
 }
 
 void GhostSymbolicRegion::dumpToStream(raw_ostream &os) const {
@@ -920,6 +936,12 @@ MemRegionManager::getCXXStaticTempObjectRegion(const Expr *Ex) {
       Ex, getGlobalsRegion(MemRegion::GlobalInternalSpaceRegionKind, nullptr));
 }
 
+const GhostFieldRegion *
+MemRegionManager::getGhostFieldRegion(const SmartStateTrait &Trait,
+                                      const MemRegion *superRegion) {
+  return getSubRegion<GhostFieldRegion>(Trait, superRegion);
+}
+
 const GhostSymbolicRegion *
 MemRegionManager::getGhostSymbolicRegion(const SmartStateTrait &Trait,
                                          SymbolRef Sym) {
@@ -1119,6 +1141,7 @@ const MemRegion *MemRegion::getBaseRegion() const {
       case MemRegion::FieldRegionKind:
       case MemRegion::ObjCIvarRegionKind:
       case MemRegion::CXXBaseObjectRegionKind:
+      case MemRegion::GhostFieldRegionKind:
         R = cast<SubRegion>(R)->getSuperRegion();
         continue;
       default:
@@ -1387,6 +1410,12 @@ RegionOffset MemRegion::getAsOffset() const {
       // This is offset in bits.
       Offset += Layout.getFieldOffset(idx);
       break;
+    }
+    case GhostFieldRegionKind: {
+      const GhostFieldRegion *GR = cast<GhostFieldRegion>(R);
+      SymbolicOffsetBase = R;
+      R = GR->getSuperRegion();
+      continue;
     }
     }
   }
