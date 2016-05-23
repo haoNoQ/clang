@@ -422,6 +422,18 @@ void CXXBaseObjectRegion::Profile(llvm::FoldingSetNodeID &ID) const {
   ProfileRegion(ID, getDecl(), isVirtual(), superRegion);
 }
 
+void GhostVarRegion::ProfileRegion(llvm::FoldingSetNodeID &ID,
+                                   const SmartStateTrait &Trait,
+                                   const MemRegion *SReg) {
+  ID.AddInteger(GhostVarRegionKind);
+  ID.AddInteger(Trait.getTraitID());
+  ID.AddPointer(SReg);
+}
+
+void GhostVarRegion::Profile(llvm::FoldingSetNodeID &ID) const {
+  ProfileRegion(ID, Trait, getSuperRegion());
+}
+
 void GhostFieldRegion::ProfileRegion(llvm::FoldingSetNodeID &ID,
                                      const SmartStateTrait &Trait,
                                      const MemRegion *SReg) {
@@ -549,6 +561,10 @@ void SymbolicRegion::dumpToStream(raw_ostream &os) const {
 
 void VarRegion::dumpToStream(raw_ostream &os) const {
   os << *cast<VarDecl>(D);
+}
+
+void GhostVarRegion::dumpToStream(raw_ostream &os) const {
+  os << getTrait().getTraitDescription();
 }
 
 void GhostFieldRegion::dumpToStream(raw_ostream &os) const {
@@ -770,6 +786,26 @@ MemRegionManager::getGhostSpaceRegion(const SmartStateTrait &Trait) {
   return R;
 }
 
+const MemSpaceRegion *
+MemRegionManager::getPreferredSpaceRegion(const SmartStateTrait &Trait) {
+  if (Trait.hasDefaultMemSpace())
+    return getGhostSpaceRegion(Trait);
+  switch (MemRegion::Kind K = Trait.getTraitMemSpacePreference()) {
+  case MemRegion::GlobalImmutableSpaceRegionKind:
+  case MemRegion::GlobalInternalSpaceRegionKind:
+  case MemRegion::GlobalSystemSpaceRegionKind:
+    return getGlobalsRegion(K);
+  case MemRegion::HeapSpaceRegionKind:
+    return getHeapRegion();
+  case MemRegion::CodeSpaceRegionKind:
+    return getCodeRegion();
+  case MemRegion::UnknownSpaceRegionKind:
+    return getUnknownRegion();
+  default:
+    llvm_unreachable("Unsupported preferred memory space!");
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // Constructing regions.
 //===----------------------------------------------------------------------===//
@@ -936,16 +972,25 @@ MemRegionManager::getCXXStaticTempObjectRegion(const Expr *Ex) {
       Ex, getGlobalsRegion(MemRegion::GlobalInternalSpaceRegionKind, nullptr));
 }
 
+const GhostVarRegion *
+MemRegionManager::getGhostVarRegion(const SmartStateTrait &Trait,
+                                    const MemRegion *superRegion) {
+  if (!superRegion)
+    superRegion = getPreferredSpaceRegion(Trait);
+  return getSubRegion<GhostVarRegion>(Trait, superRegion);
+}
+
 const GhostFieldRegion *
 MemRegionManager::getGhostFieldRegion(const SmartStateTrait &Trait,
                                       const MemRegion *superRegion) {
   return getSubRegion<GhostFieldRegion>(Trait, superRegion);
 }
 
-const GhostSymbolicRegion *
-MemRegionManager::getGhostSymbolicRegion(const SmartStateTrait &Trait,
-                                         SymbolRef Sym) {
-  return getSubRegion<GhostSymbolicRegion>(Sym, getGhostSpaceRegion(Trait));
+const GhostSymbolicRegion *MemRegionManager::getGhostSymbolicRegion(
+    const SmartStateTrait &Trait, SymbolRef Sym, const MemRegion *superRegion) {
+  if (!superRegion)
+    superRegion = getPreferredSpaceRegion(Trait);
+  return getSubRegion<GhostSymbolicRegion>(Sym, superRegion);
 }
 
 const CompoundLiteralRegion*
@@ -1289,6 +1334,7 @@ RegionOffset MemRegion::getAsOffset() const {
     case ObjCStringRegionKind:
     case VarRegionKind:
     case CXXTempObjectRegionKind:
+    case GhostVarRegionKind:
     case GhostSymbolicRegionKind:
       // Usual base regions.
       goto Finish;

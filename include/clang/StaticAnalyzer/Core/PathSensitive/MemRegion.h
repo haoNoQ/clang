@@ -1094,6 +1094,7 @@ const RegionTy* MemRegion::getAs() const {
 class SmartStateTrait {
   std::string Desc;
   QualType Ty;
+  enum MemSpacePrefTy { NoMemSpacePreference = -1 } MemSpacePref;
 #ifndef NDEBUG
   bool Initialized;
 #endif
@@ -1103,13 +1104,15 @@ public:
   SmartStateTrait() : Initialized(false) {}
 #endif
 
-  void initialize(const std::string &D, QualType T) {
+  void initialize(const std::string &D, QualType T,
+                  int P = NoMemSpacePreference) {
     assert(!Initialized);
 #ifndef NDEBUG
     Initialized = true;
 #endif
     Desc = D;
     Ty = T;
+    MemSpacePref = static_cast<MemSpacePrefTy>(P);
   }
 
   typedef uintptr_t IdTy;
@@ -1125,6 +1128,13 @@ public:
   QualType getTraitType() const {
     assert(Initialized);
     return Ty;
+  }
+  bool hasDefaultMemSpace() const {
+    return MemSpacePref == NoMemSpacePreference;
+  }
+  MemRegion::Kind getTraitMemSpacePreference() const {
+    assert(!hasDefaultMemSpace());
+    return static_cast<MemRegion::Kind>(MemSpacePref);
   }
 };
 
@@ -1144,6 +1154,34 @@ public:
 
   static bool classof(const MemRegion *R) {
     return R->getKind() == GhostSpaceRegionKind;
+  }
+};
+
+class GhostVarRegion : public TypedValueRegion {
+  friend class MemRegionManager;
+
+  const SmartStateTrait &Trait;
+
+  GhostVarRegion(const SmartStateTrait &Trait, const MemRegion *SReg)
+      : TypedValueRegion(SReg, GhostVarRegionKind), Trait(Trait) {}
+
+public:
+  const SmartStateTrait &getTrait() const { return Trait; }
+
+  virtual bool isBoundable() const override { return true; }
+
+  QualType getValueType() const override { return getTrait().getTraitType(); }
+
+  void Profile(llvm::FoldingSetNodeID &ID) const override;
+
+  static void ProfileRegion(llvm::FoldingSetNodeID &ID,
+                            const SmartStateTrait &Trait,
+                            const MemRegion *SuperRegion);
+
+  void dumpToStream(raw_ostream &os) const override;
+
+  static bool classof(const MemRegion *R) {
+    return R->getKind() == GhostVarRegionKind;
   }
 };
 
@@ -1272,6 +1310,7 @@ public:
   const CodeSpaceRegion *getCodeRegion();
 
   const GhostSpaceRegion *getGhostSpaceRegion(const SmartStateTrait &Trait);
+  const MemSpaceRegion *getPreferredSpaceRegion(const SmartStateTrait &Trait);
 
   /// getAllocaRegion - Retrieve a region associated with a call to alloca().
   const AllocaRegion *getAllocaRegion(const Expr *Ex, unsigned Cnt,
@@ -1375,11 +1414,15 @@ public:
   /// super-region used.
   const CXXTempObjectRegion *getCXXStaticTempObjectRegion(const Expr *Ex);
 
+  const GhostVarRegion *
+  getGhostVarRegion(const SmartStateTrait &Trait,
+                    const MemRegion *superRegion = nullptr);
   const GhostFieldRegion *getGhostFieldRegion(const SmartStateTrait &Trait,
                                               const MemRegion *superRegion);
 
   const GhostSymbolicRegion *
-  getGhostSymbolicRegion(const SmartStateTrait &Trait, SymbolRef Sym);
+  getGhostSymbolicRegion(const SmartStateTrait &Trait, SymbolRef Sym,
+                         const MemRegion *superRegion = nullptr);
 
 private:
   template <typename RegionTy, typename A1>

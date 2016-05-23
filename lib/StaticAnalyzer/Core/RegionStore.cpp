@@ -2375,6 +2375,11 @@ void removeDeadBindingsWorker::VisitAddedToCluster(const MemRegion *baseR,
     return;
   }
 
+  if (isa<GhostVarRegion>(baseR)) {
+    AddToWorkList(baseR, &C);
+    return;
+  }
+
   if (const SymbolicRegion *SR = dyn_cast<SymbolicRegion>(baseR)) {
     if (SymReaper.isLive(SR->getSymbol()))
       AddToWorkList(SR, &C);

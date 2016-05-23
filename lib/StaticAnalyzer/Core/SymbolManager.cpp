@@ -433,6 +433,9 @@ bool SymbolReaper::isLiveRegion(const MemRegion *MR) {
   if (const VarRegion *VR = dyn_cast<VarRegion>(MR))
     return isLive(VR, true);
 
+  if (isa<GhostVarRegion>(MR))
+    return true;
+
   // FIXME: This is a gross over-approximation. What we really need is a way to
   // tell if anything still refers to this region. Unlike SymbolicRegions,
   // AllocaRegions don't have associated symbols, though, so we don't actually

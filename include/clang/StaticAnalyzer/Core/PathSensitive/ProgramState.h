@@ -234,6 +234,11 @@ public:
 
   ProgramStateRef bindLoc(SVal location, SVal V) const;
 
+  // Sets the smart trait variable.
+  ProgramStateRef bindLoc(const SmartStateTrait &Trait, SVal Val) const;
+  // Sets the smart trait variable - a convenient override when
+  // the trait has an integer type or an enumeration type.
+  ProgramStateRef bindLoc(const SmartStateTrait &Trait, uint64_t Val) const;
   // Sets the smart trait field inside the region.
   ProgramStateRef bindLoc(const SmartStateTrait &Trait, const MemRegion *Reg,
                           SVal Val) const;
@@ -335,6 +340,9 @@ public:
   SVal getSVal(const MemRegion* R) const;
 
   SVal getSValAsScalarOrLoc(const MemRegion *R) const;
+
+  /// Returns the SVal that corresponds to the given smart variable.
+  SVal getSVal(const SmartStateTrait &Trait) const;
 
   /// Returns the SVal that corresponds to the given smart field of the region.
   SVal getSVal(const SmartStateTrait &Trait, const MemRegion *Reg) const;
@@ -723,6 +731,21 @@ inline ProgramStateRef ProgramState::bindLoc(SVal LV, SVal V) const {
 }
 
 inline ProgramStateRef ProgramState::bindLoc(const SmartStateTrait &Trait,
+                                             SVal Val) const {
+  MemRegionManager &MemMgr = getStateManager().getRegionManager();
+  const MemRegion *MR = MemMgr.getGhostVarRegion(Trait);
+  return bindLoc(loc::MemRegionVal(MR), Val, false);
+}
+
+inline ProgramStateRef ProgramState::bindLoc(const SmartStateTrait &Trait,
+                                             uint64_t Val) const {
+  SValBuilder &SVB = getStateManager().getSValBuilder();
+  QualType T = Trait.getTraitType();
+  assert(T->isIntegralOrEnumerationType());
+  return bindLoc(Trait, SVB.makeIntVal(Val, T));
+}
+
+inline ProgramStateRef ProgramState::bindLoc(const SmartStateTrait &Trait,
                                              const MemRegion *Reg,
                                              SVal Val) const {
   MemRegionManager &MemMgr = getStateManager().getRegionManager();
@@ -826,6 +849,12 @@ inline SVal ProgramState::getRawSVal(Loc LV, QualType T) const {
 inline SVal ProgramState::getSVal(const MemRegion* R) const {
   return getStateManager().StoreMgr->getBinding(getStore(),
                                                 loc::MemRegionVal(R));
+}
+
+inline SVal ProgramState::getSVal(const SmartStateTrait &Trait) const {
+  MemRegionManager &MemMgr = getStateManager().getRegionManager();
+  const MemRegion *MR = MemMgr.getGhostVarRegion(Trait);
+  return getSVal(MR);
 }
 
 inline SVal ProgramState::getSVal(const SmartStateTrait &Trait,
